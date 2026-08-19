@@ -504,6 +504,22 @@
     }
     
     /**
+     * Mirrors getTiebreakerGame() in picks.gs: the tiebreaker rides on the late
+     * Monday night game, falling back to the last kickoff of the week (playoffs).
+     * Keep these two in sync — the label here must name the game the form asks about.
+     */
+    const DAY_ORDER = { 'Wednesday': -4, 'Thursday': -3, 'Friday': -2, 'Saturday': -1, 'Sunday': 0, 'Monday': 1 };
+    function getTiebreakerGameForWeek(games) {
+      if (!games || games.length === 0) return null;
+      const kickoff = (game) => ((DAY_ORDER[game.dayName] || 0) * 1440) + ((Number(game.hour) || 0) * 60) + (Number(game.minute) || 0);
+      const mondayGames = games.filter(game => game.dayName === 'Monday');
+      const pool = mondayGames.length > 0 ? mondayGames : games;
+      let latest = pool[0];
+      pool.forEach(game => { if (kickoff(game) >= kickoff(latest)) latest = game; });
+      return latest;
+    }
+
+    /**
      * Render the single over/under tiebreaker input.
      */
     function renderTiebreakerOverUnder() {
@@ -521,16 +537,20 @@
         return;
       }
 
-      const lastGame = includedGames[includedGames.length - 1];
-      const lastGameId = `${lastGame.awayTeam}@${lastGame.homeTeam}`;
+      const tiebreakerGame = getTiebreakerGameForWeek(includedGames);
+      if (!tiebreakerGame) {
+        container.classList.add('hidden');
+        container.innerHTML = '';
+        return;
+      }
 
       // Use the saved tiebreaker value if it exists, otherwise get from game data
-      const overUnderValue = (tiebreakerOverUnder !== null) ? tiebreakerOverUnder : (lastGame.overUnder || '');;
+      const overUnderValue = (tiebreakerOverUnder !== null) ? tiebreakerOverUnder : (tiebreakerGame.overUnder || '');
       
       const isValid = isValidOverUnder(overUnderValue);
 
       let html = `
-        <label for="tiebreaker-input">Tiebreaker Over/Under for ${lastGame.awayTeam} @ ${lastGame.homeTeam}</label>
+        <label for="tiebreaker-input">Tiebreaker Over/Under for ${tiebreakerGame.awayTeam} @ ${tiebreakerGame.homeTeam}${tiebreakerGame.dayName === 'Monday' ? ' (late MNF)' : ''}</label>
         <input type="number" id="tiebreaker-input" class="live-input ${!isValid ? 'invalid-input' : ''}" 
           value="${overUnderValue}" placeholder="e.g., 48.5" step="0.5">
       `;
@@ -1013,12 +1033,15 @@
         games: []
       }
 
+      const submissionTiebreakerGame = getTiebreakerGameForWeek(includedGames);
+      const tiebreakerGameId = submissionTiebreakerGame ? `${submissionTiebreakerGame.awayTeam}@${submissionTiebreakerGame.homeTeam}` : null;
+
       includedGames.forEach((originalGame, index) => {
         const gameId = `${originalGame.awayTeam}@${originalGame.homeTeam}`;
         let overUnderValue = editedSpreadData[gameId]?.overUnder ?? originalGame.overUnder;
         
-        // MODIFICATION: Override the last game's O/U with the tiebreaker value
-        if (showOverUnder && index === includedGames.length - 1) {
+        // Override the tiebreaker game's O/U with the value entered above
+        if (showOverUnder && tiebreakerGameId && gameId === tiebreakerGameId) {
           overUnderValue = tiebreakerOverUnder;
         }
 
