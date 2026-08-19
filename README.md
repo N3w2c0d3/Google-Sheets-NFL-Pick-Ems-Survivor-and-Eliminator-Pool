@@ -1,3 +1,15 @@
+> ### 🏈 This is a customized fork
+>
+> This branch adds **seven simultaneous pools**, a payout engine, a standalone sign-up form,
+> and commissioner tooling on top of Ben's template.
+>
+> **→ [See what's different: CUSTOM-FEATURES.md](CUSTOM-FEATURES.md)**
+>
+> For the original, unmodified tool, go to
+> [boilermaker-ben/Google-Sheets-NFL-Pick-Ems-Survivor-and-Eliminator-Pool](https://github.com/boilermaker-ben/Google-Sheets-NFL-Pick-Ems-Survivor-and-Eliminator-Pool).
+> All credit for it belongs to Ben Powers.
+
+---
 # Google Sheets / Forms NFL Pick'Ems and Survivor Pool, v1.2.0
 ## Creation and Management Tool for Running your Own Group
 
