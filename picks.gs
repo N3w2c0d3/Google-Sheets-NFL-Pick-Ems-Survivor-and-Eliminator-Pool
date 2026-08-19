@@ -84,19 +84,29 @@ function onOpen() {
     }
     menu.addItem('⚙️ Configuration', 'launchConfiguration')
       .addItem('👥 Member Manager', 'launchMemberPanel');
+    menu.addSubMenu(ui.createMenu('✍️ Sign-Ups')
+      .addItem('📝 Create or Open Sign-Up Form','launchSignupForm')
+      .addItem('📥 Import Sign-Ups','importSignups'));
     
     if (docProps.getProperty('forms')) {
       menu.addSeparator()
+      .addItem('✅ Close Out Week','closeOutWeek')
       .addItem(`🏈 Fetch ${LEAGUE} Outcomes`,'launchApiOutcomeImport')
+      .addItem('📧 Remind Non-Respondents','remindNonRespondents')
       menu.addSubMenu(ui.createMenu('🧰 Utilities')
         .addItem(`📅 Update ${LEAGUE} Data`, 'fetchSchedule')
         .addItem('📊 Update Spread Data','fetchLatestSpreadsForWeek')
         .addItem('✏️ Rename a Member','showRenamePanel')
         .addItem('🧮 Update Formulas', 'allFormulasUpdate')
         .addItem('✅ Update Outcomes Sheet Validation','outcomesSheetUpdatePrompt')
-        .addItem('🔽 Deploy Extra Tracking Sheets','setupSheets'));
+        .addItem('🔽 Deploy Extra Tracking Sheets','setupSheets')
+        .addItem('💵 Update Payouts','updatePayouts')
+        .addItem('🩺 Health Check','healthCheck')
+        .addItem('📸 Snapshot Spreadsheet','snapshotSpreadsheet'));
       let subMenu = ui.createMenu('🧙 Automation')
-        .addItem('📡 Spread Auto-Fetch Panel','showAutoFetchPanel');
+        .addItem('📡 Spread Auto-Fetch Panel','showAutoFetchPanel')
+        .addItem('🔒 Kickoff Lock On/Off','toggleKickoffLock')
+        .addItem('📧 Auto-Remind On/Off','toggleAutoRemind');
       if (contest) {
         subMenu.addItem(`✅ Enable ${survElimIcons} Triggers`,'createOnEditTrigger')
           .addItem(`⭕ Disable ${survElimIcons} Triggers`,'deleteOnEditTrigger');
@@ -177,7 +187,12 @@ const WEEKNAME = { 19: {"name":"WildCard","teams":12,"matchups":6}, 20: {"name":
 const weeklySheetPrefix = "WK";
 const schedulePrefix = "https://lm-api-reads.fantasy.espn.com/apis/v3/games/ffl/seasons/";
 const scheduleSuffix = "?view=proTeamSchedules";
-const fallbackYear = 2025;
+
+// ESPN fetch hardening (see espnFetch in UTILITIES) — Google's servers get 403'd without these
+const ESPN_USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
+const ESPN_FETCH_ATTEMPTS = 3;
+const ESPN_FETCH_BACKOFF_MS = 800;
+const fallbackYear = 2026;
 const pickColors = {
   correct:   { even: '#c9ffdf', odd: '#a0fdba', end: '#69ffa6', font: '#000000' },
   incorrect: { even: '#fff7f9', odd: '#fff2f4', end: '#fcd4dc', font: '#999999' },
@@ -190,6 +205,66 @@ const dayColors = ["#ffe3cc", "#fffdcc","#e7fed1","#cffdda","#bbfbe7","#adf7f5"]
 const dayColorsFilled = ["#ffeb90", "#fffb95","#d4ffa6","#abffbf","#89fddb","#74f7f3"];
 const configTabColor = "#ff9561";
 const leaderboardTabColor = "#55ff90";
+
+// ============================================================================================================================================
+// POOL & PAYOUT CONFIGURATION
+// ============================================================================================================================================
+//
+// >>> SET THESE FEES TO YOUR OWN POOL'S NUMBERS BEFORE RUNNING A SEASON. <<<
+//
+// Every fee below is a $1 placeholder so the arithmetic is easy to follow. They are not
+// meant to be used as-is.
+//
+// "fee" is charged per entry. "weeks" multiplies the per-entry cost, so a weekly pool's pot
+// for a SINGLE week is fee x entries, while its season-long contribution is
+// fee x entries x weeks. Every pot in the workbook is derived from these two numbers plus
+// the entry count, so changing a fee here and re-running "Update Payouts" flows it through
+// every tab -- there are no hardcoded dollar amounts anywhere else.
+//
+// With these placeholders the entry total is $44 per member
+// (18 + 18 + 1 + 1 + 1 + 4 + 1), and at 25 entries the weekly pot would be $25.
+//
+// Drop a pool you do not run by deleting its line. Its column disappears from
+// Summary Payout and its pot stops being collected.
+const POOLS = [
+  { key: 'weeklyWins',      label: 'Weekly Wins',                    fee: 1,  weeks: 18, cadence: 'weekly'   },
+  { key: 'weeklyConsensus', label: 'Weekly Consensus',               fee: 1,  weeks: 18, cadence: 'weekly'   },
+  { key: 'seasonPct',       label: 'Season % Correct (best 16 wks)', fee: 1,  weeks: 1,  cadence: 'season'   },
+  { key: 'seasonPoints',    label: 'Season Total Points',            fee: 1,  weeks: 1,  cadence: 'season'   },
+  { key: 'seasonConsensus', label: 'Season Consensus',               fee: 1,  weeks: 1,  cadence: 'season'   },
+  { key: 'postSeason',      label: 'Post Season',                    fee: 1,  weeks: 4,  cadence: 'playoffs' },
+  { key: 'perfectWeek',     label: 'Perfect Week Pool',              fee: 1,  weeks: 1,  cadence: 'season'   }
+];
+
+// Reminders to anyone who has not submitted go out this many hours before the week's first
+// kickoff. The first kickoff is used rather than "Thursday" specifically, because some weeks
+// open Wednesday (2026 week 1) or have Friday games -- this always lands before any game starts.
+const REMINDER_HOURS_BEFORE_KICKOFF = 4;
+
+// Pool 3 keeps each player's best 16 weekly percentages out of the 18 regular-season weeks.
+const SEASON_PCT_WEEKS = 16;
+
+// The playoff weeks that the Post Season pool scores. Week 22 is the pre-Super Bowl bye and
+// is already excluded by WEEKS_TO_EXCLUDE; the Pro Bowl is never scored.
+const PLAYOFF_WEEKS = [19, 20, 21, 23];
+
+// Percentage of a pot paid to each finishing place. The number of paid places scales with
+// the size of the pool -- set before the season and left alone once it starts.
+const PAYOUT_LADDERS = {
+  3: [50, 30, 20],
+  4: [45, 27, 18, 10],
+  5: [40, 25, 20, 10, 5],
+  7: [34, 22, 16, 11, 8, 5, 4]
+};
+
+// Entry-count breakpoints deciding how many places get paid.
+const PAYOUT_PLACE_BREAKPOINTS = [
+  { minEntries: 35, places: 7 },
+  { minEntries: 25, places: 5 },
+  { minEntries: 15, places: 4 },
+  { minEntries: 0,  places: 3 }
+];
+
 const generalTabColor = "#aaaaaa";
 const winnersTabColor = "#ffee00";
 const survElimTabColors = {"survivor":"#ffee00","eliminator":"#fca503"}
@@ -1021,6 +1096,15 @@ function setupSheets() {
     ss.toast('Members not found or not set up yet, launching now...','⚠️ MEMBERS NEEDED');
     return;
   }
+  // This rebuilds tabs in place, so offer a full copy first once there is data worth keeping
+  if (config.initialized) {
+    const ui = fetchUi();
+    const backup = ui.alert(`📸 SNAPSHOT FIRST?`,
+      `Deploying the tracking sheets rebuilds them in place.\n\nSave a timestamped copy of this spreadsheet first?`,
+      ui.ButtonSet.YES_NO_CANCEL);
+    if (backup === ui.Button.CANCEL) return;
+    if (backup === ui.Button.YES) snapshotSpreadsheet(true);
+  }
   try {
     const year = fetchYear();
     let week = fetchWeek();
@@ -1043,6 +1127,11 @@ function setupSheets() {
       pctSheet(ss,memberData);
       Logger.log('Deployed Weekly Percentages sheet');
       ss.toast('Deployed Weekly Percentages sheet');
+
+      // Creates the money tabs (Wkly Payout, Wkly Consensus, Season Points, Summary Payout)
+      updatePayoutSheetsQuietly(ss);
+      Logger.log('Deployed payout sheets');
+      ss.toast('Deployed payout sheets');
     
       // Creates Winners Sheet
       winnersSheet(ss,year);
@@ -1324,7 +1413,7 @@ function processMemberSubmission(clientData) {
  * @param {number} joinWeek The week number the member is joining in.
  * @returns {Object} The complete new member object.
  */
-function createNewMember(name, isPaid, config, joinWeek) {
+function createNewMember(name, isPaid, config, joinWeek, extras) {
   // Create an array with (joinWeek - 1) empty slots for weeks they missed.
   const pastWeekPadding = Array(joinWeek > 1 ? joinWeek - 1 : 0).fill(null);
 
@@ -1333,6 +1422,12 @@ function createNewMember(name, isPaid, config, joinWeek) {
     paid: isPaid,
     active: true,
     joinDate: new Date().toISOString(),
+
+    // Sign-up details, when the member came in through the sign-up form.
+    // "name" is the team name (what shows on the WK sheets and in the weekly form);
+    // "manager" is the actual person, which the payout tab needs.
+    manager: (extras && extras.manager) || '',
+    email: (extras && extras.email) || '',
     
     // Survivor Properties
     sR: [...pastWeekPadding],
@@ -1823,7 +1918,7 @@ function fetchYear(apiPull) {
     Logger.log(`❌ No year currently recorded for league, fetching from ESPN API...`)
   }
   try {
-    year = JSON.parse(UrlFetchApp.fetch(SCOREBOARD).getContentText()).season.year.toString();
+    year = espnFetchJson(SCOREBOARD).season.year.toString();
     if (year) {
       yearInvalid = !yearRegEx.test(year);
       if (yearInvalid) {
@@ -1876,7 +1971,7 @@ function fetchYear(apiPull) {
 function fetchWeek(negative,current) {
   let weeks, week, advance = 0;
   try {
-    const obj = JSON.parse(UrlFetchApp.fetch(SCOREBOARD));
+    const obj = espnFetchJson(SCOREBOARD);
     let season = obj.season.type;
     obj.leagues[0].calendar.forEach(entry => {
       if (entry.value == season) {
@@ -1929,7 +2024,7 @@ function fetchScoreboardEndpoint(week, leg) {
 
   // Fetch current data only if week or leg is still missing
   if (!week || !leg) {
-    current = JSON.parse(UrlFetchApp.fetch(SCOREBOARD).getContentText());
+    current = espnFetchJson(SCOREBOARD);
   }
   
   week = week || current.week.number;
@@ -1968,7 +2063,7 @@ function fetchTeamsESPN(year) {
   try {
     let string = schedulePrefix + year + scheduleSuffix;
     Logger.log(`🔎 Fetching JSON content from: ${string}`);
-    obj = JSON.parse(UrlFetchApp.fetch(string).getContentText());
+    obj = espnFetchJson(string);
     let objTeams = obj.settings.proTeams;
     return objTeams;
   }
@@ -2291,7 +2386,7 @@ function fetchSchedule(ss,year,currentWeek,auto,overwrite) {
 
   let scoreboardData = [];
   try {
-    const response = UrlFetchApp.fetch(scoreboardUrl);
+    const response = espnFetch(scoreboardUrl);
     const obj = JSON.parse(response.getContentText());
     
     for (let event = 0; event < obj.events.length; event++) {
@@ -2570,12 +2665,12 @@ function fetchLatestSpreadsForWeek(headless, targetWeek) {
       // If a specific week is provided, use it directly
       weekToUpdate = targetWeek;
       if (!headless) ss.toast(`Checking for data in Week ${weekToUpdate}...`, `🎯 Targeting Week ${weekToUpdate}`);
-      const response = UrlFetchApp.fetch(`${SCOREBOARD}?week=${weekToUpdate}`);
+      const response = espnFetch(`${SCOREBOARD}?week=${weekToUpdate}`);
       dataToProcess = JSON.parse(response.getContentText());
       year = dataToProcess.season.year;
     } else {
       // --- Auto-detection logic ---
-      const initialResponse = UrlFetchApp.fetch(SCOREBOARD);
+      const initialResponse = espnFetch(SCOREBOARD);
       dataToProcess = JSON.parse(initialResponse.getContentText());
       
       let currentWeek = dataToProcess.week.number;
@@ -2588,7 +2683,7 @@ function fetchLatestSpreadsForWeek(headless, targetWeek) {
       if (allGamesCompleted) {
         if (!headless) ss.toast(`Week ${currentWeek} is complete. Targeting next week...`, `⏩ Week ${currentWeek + 1}`);
         weekToUpdate = currentWeek + 1;
-        const nextWeekResponse = UrlFetchApp.fetch(`${SCOREBOARD}?week=${weekToUpdate}`);
+        const nextWeekResponse = espnFetch(`${SCOREBOARD}?week=${weekToUpdate}`);
         dataToProcess = JSON.parse(nextWeekResponse.getContentText());
       }
     }
@@ -2758,7 +2853,7 @@ function fetchGames(week) {
 // NFL Schedule from ESPN API Scoreboard
 function fetchMatchups() {
   let data = [];
-  const obj = JSON.parse(UrlFetchApp.fetch(SCOREBOARD));
+  const obj = espnFetchJson(SCOREBOARD);
   let week = obj.season === 2 ? obj.week.number : (obj.season.type === 3 ? obj.week.number + REGULAR_SEASON : null);
   if (week === null) {
     throw new Error('Issue with the ESPN API for week');
@@ -2814,7 +2909,7 @@ function fetchLogos(){
   let obj = {};
   let logos = {};
   try{
-    obj = JSON.parse(UrlFetchApp.fetch(SCOREBOARD));
+    obj = espnFetchJson(SCOREBOARD);
   }
   catch (err) {
     Logger.log(`⚠️ Fetch Logo error: ${err.stack}`);
@@ -2947,7 +3042,7 @@ function parseAllApiEvents(apiProTeams, formsData) {
 
   formsData = formsData || JSON.parse(docProps.getProperty('forms'));
   
-  apiProTeams = apiProTeams || JSON.parse(UrlFetchApp.fetch(`${schedulePrefix}${fetchYear()}${scheduleSuffix}`).getContentText()).settings.proTeams || [];
+  apiProTeams = apiProTeams || espnFetchJson(`${schedulePrefix}${fetchYear()}${scheduleSuffix}`).settings.proTeams || [];
 
   // 1. Create a map for Team ID to Abbreviation (e.g., {11: "Ind"})
   const teamIdMap = {};
@@ -3063,7 +3158,7 @@ function parseAllApiEvents(apiProTeams, formsData) {
 }
 
 function getScoreImportData() {
-  const apiProTeams = JSON.parse(UrlFetchApp.fetch(`${schedulePrefix}${fetchYear()}${scheduleSuffix}`).getContentText()).settings.proTeams || [];
+  const apiProTeams = espnFetchJson(`${schedulePrefix}${fetchYear()}${scheduleSuffix}`).settings.proTeams || [];
   if (!apiProTeams) {
     SpreadsheetApp.getActiveSpreadsheet().toast(`Error fetching API data, canceling...`,`API ERROR`);
     throw new Error("Could not load API data.");
@@ -3152,33 +3247,51 @@ function updateSheetsWithApiOutcomes(ss, week, completedGames, formsData, boolea
       }
     }
     if (config.tiebreakerInclude) {
-      const tiebreaker = formsData[week].gamePlan.games[formsData[week].gamePlan.games.length - 1];
-      const tiebreakerMatchup = `${tiebreaker.awayTeam} @ ${tiebreaker.homeTeam}`;
-      Logger.log(`⚖️ From the forms data for week ${week}, the final matchup for use as a tiebreaker is ${tiebreakerMatchup}. Checking for outcome availability...`)
-      const tiebreakerMatchupDetails = completedGames.find(game => game.shortName === tiebreakerMatchup);
-      if (tiebreakerMatchupDetails) {
-        const score = parseInt(tiebreakerMatchupDetails.awayScore) + parseInt(tiebreakerMatchupDetails.homeScore);
-        Logger.log(`🔥 ${tiebreakerMatchupDetails.winner} won the matchup, combined score of ${score}`);
-        if (score) {
-          let weeklySheetTiebreakerRange = ss.getRangeByName(`${LEAGUE}_TIEBREAKER_${week}_OUTCOME`);
-          if (weeklySheetTiebreakerRange) {
-            weeklySheetTiebreakerRange.setValue(score);
-            Logger.log(`👔 Successfully placed combined score of ${score} from the ${tiebreakerMatchup} tiebreaker matchup (✔️ week ${week} named range used).`);
+      const weekGamePlan = formsData[week].gamePlan;
+      // Use the game the form actually asked about. Weeks built before the tiebreaker
+      // game was pinned into the plan fall back to deriving it the same way.
+      const tiebreakerGame = weekGamePlan.tiebreakerGame || getTiebreakerGame(weekGamePlan.games);
+      const tiebreakerMatchup = tiebreakerGame ? `${tiebreakerGame.awayTeam} @ ${tiebreakerGame.homeTeam}` : null;
+
+      const placeOutcome = (outcomeRangeName, groupRangeName, value, label) => {
+        let range = ss.getRangeByName(outcomeRangeName);
+        if (!range) {
+          // Fall back to the outcome cell three rows below the member entry block
+          const groupRange = ss.getRangeByName(groupRangeName);
+          if (groupRange) range = groupRange.getSheet().getRange(groupRange.getLastRow() + 3, groupRange.getColumn());
+        }
+        if (range) {
+          range.setValue(value);
+          Logger.log(`👔 Placed ${label} of ${value} from ${tiebreakerMatchup} (week ${week}).`);
+          return true;
+        }
+        Logger.log(`❗👔 Found ${label} of ${value} for ${tiebreakerMatchup} but no ${outcomeRangeName} range to place it in`);
+        ss.toast(`Found ${label} of ${value} for ${tiebreakerMatchup} but could not place it`,`❗ TIEBREAKER NOT PLACED`);
+        return false;
+      };
+
+      if (!tiebreakerMatchup) {
+        Logger.log(`⚠️ No tiebreaker game could be determined for week ${week}; skipping tiebreaker outcomes.`);
+      } else {
+        Logger.log(`⚖️ Week ${week} tiebreaker game is ${tiebreakerMatchup}. Checking for outcome availability...`);
+        const tiebreakerMatchupDetails = completedGames.find(game => game.shortName === tiebreakerMatchup);
+        if (tiebreakerMatchupDetails) {
+          const awayScore = parseInt(tiebreakerMatchupDetails.awayScore);
+          const homeScore = parseInt(tiebreakerMatchupDetails.homeScore);
+          const combinedScore = awayScore + homeScore;
+          // TB2 is the winning team's points; on a tie both teams scored the same
+          const winningScore = Math.max(awayScore, homeScore);
+          Logger.log(`🔥 ${tiebreakerMatchupDetails.winner} won the matchup — combined score ${combinedScore}, winning team scored ${winningScore}`);
+          if (Number.isFinite(combinedScore) && Number.isFinite(winningScore)) {
+            placeOutcome(`${LEAGUE}_TIEBREAKER_${week}_OUTCOME`, `${LEAGUE}_TIEBREAKER_${week}`, combinedScore, 'combined score');
+            placeOutcome(`${LEAGUE}_TIEBREAKER2_${week}_OUTCOME`, `${LEAGUE}_TIEBREAKER2_${week}`, winningScore, 'winning team score');
           } else {
-            let weeklySheetGroupTiebreakerRange = ss.getRangeByName(`${LEAGUE}_TIEBREAKER_${week}`); // If the outcome cell isn't established
-            weeklySheetTiebreakerRange = weeklySheetGroupTiebreakerRange.getSheet().getRange(weeklySheetGroupTiebreakerRange.getLastRow()+3,weeklySheetGroupTiebreakerRange.getColumn());
-            if (weeklySheetTiebreakerRange) {
-              weeklySheetTiebreakerRange.setValue(score);
-              Logger.log(`👔 Successfully placed combined score of ${score} from the ${tiebreakerMatchup} tiebreaker matchup (❗ week ${week} fallback tiebreaker column used).`);
-            }
+            Logger.log(`❗👔 Scores for ${tiebreakerMatchup} were not numeric (away: ${tiebreakerMatchupDetails.awayScore}, home: ${tiebreakerMatchupDetails.homeScore}); skipping placement.`);
           }
         } else {
-          Logger.log(`❗👔 Found a tiebreaker score of ${score} for the ${tiebreakerMatchup} game, but was unable to place it`);
-          ss.toast(`👔 Found a tiebreaker score of ${score} for the ${tiebreakerMatchup} game, but was unable to place it`,`❗ TIEBREAKER NOT PLACED`);
+          Logger.log(`⏩ Tiebreaker matchup for week ${week} of ${tiebreakerMatchup} incomplete, skipping tiebreaker for now.`)
+          ss.toast(`Tiebreaker matchup for week ${week} of ${tiebreakerMatchup} incomplete, skipping tiebreaker for now.`,`⏩ TIEBREAKER NOT AVAILABLE`);
         }
-      } else {
-        Logger.log(`⏩ Tiebreaker matchup for week ${week} of ${tiebreakerMatchup} incomplete, skipping tiebreaker for now.`)
-        ss.toast(`Tiebreaker matchup for week ${week} of ${tiebreakerMatchup} incomplete, skipping tiebreaker for now.`,`⏩ TIEBREAKER NOT AVAILABLE`);
       }
     } else {
       Logger.log(`👔 No tiebreaker configured for the pool.`);
@@ -3747,7 +3860,7 @@ function launchFormBuilder() {
     }
   } catch (err) {
     Logger.log(`⚠️ Error starting form creation: ${err.stack}`);
-    ui.alert(`An error occurred while launching the form builder.`,`⚠️ FORM BUILD ERROR`);
+    ui.alert(`⚠️ FORM BUILD ERROR`,`An error occurred while launching the form builder:\n\n${err.message}`,ui.ButtonSet.OK);
   }
 }
 
@@ -3758,8 +3871,13 @@ function templateCreationPrompt(ss,ui) {
   ui = ui || fetchUi();
   try {
     const templateForm = getTemplateForm();
+    // Null check has to come first -- getTemplateForm() returns null when the user cancels,
+    // and calling getId() on it threw a TypeError that the catch below then mislabeled.
+    if (!templateForm) {
+      Logger.log(`⛔ No template form available (user canceled or creation failed)`);
+      return;
+    }
     Logger.log(`📄 Template Form ${templateForm.getId()}`);
-    if (!templateForm) return;
 
     let response = ui.alert(
       '🎨 Customize Form Theme (One Time Only)',
@@ -3775,7 +3893,7 @@ function templateCreationPrompt(ss,ui) {
       ss.toast('Form creation canceled by user when running a form building operation',`⛔ FORM CREATION CANCELED`);
       Logger.log(`⛔ Form creation canceled by user`);
     } else {
-      ui.alert(`An unexpected error occurred: ${err.message}`,`⚠️ FORM BUILD ERROR`);
+      ui.alert(`⚠️ FORM BUILD ERROR`,`An unexpected error occurred:\n\n${err.message}`,ui.ButtonSet.OK);
       Logger.log(`⚠️ Error occurred during form building process: ${err.stack}`);
     }
   }
@@ -4030,6 +4148,22 @@ function createNewFormForWeek(gamePlan) {
     if (newFormDetails.formId) {
       // Record the current state of these properties for data fetching integrity
       gamePlan.pickemsInclude = config.pickemsInclude;
+      gamePlan.tiebreakerInclude = config.tiebreakerInclude;
+      // Pin the tiebreaker game into the saved plan so pick import and outcome
+      // placement both act on the same game the form actually asked about.
+      if (config.tiebreakerInclude) {
+        const tiebreakerGame = getTiebreakerGame(gamePlan.games);
+        if (tiebreakerGame) {
+          gamePlan.tiebreakerGame = {
+            awayTeam: tiebreakerGame.awayTeam,
+            homeTeam: tiebreakerGame.homeTeam,
+            shortName: `${tiebreakerGame.awayTeam} @ ${tiebreakerGame.homeTeam}`,
+            dayName: tiebreakerGame.dayName,
+            hour: tiebreakerGame.hour,
+            minute: tiebreakerGame.minute
+          };
+        }
+      }
       gamePlan.survivorInclude = newFormDetails.survivorInclude;
       gamePlan.eliminatorInclude = newFormDetails.eliminatorInclude;
       gamePlan.pickemsAts = config.pickemsAts;
@@ -4057,6 +4191,13 @@ function createNewFormForWeek(gamePlan) {
         setFormSubmitTrigger(newFormDetails.formId, true)
       } catch (err) {
         Logger.log(`⚠️ Could not set up trigger for new week ${week} form: ${err.stack}`);
+      }
+
+      // Schedule the automatic nudge to whoever has not submitted
+      try {
+        scheduleWeeklyReminder(week, gamePlan);
+      } catch (err) {
+        Logger.log(`⚠️ Could not schedule the week ${week} reminder: ${err.stack}`);
       }
 
       // Setting up onEdit trigger if includes pool questions
@@ -4679,7 +4820,12 @@ function addContestQuestion(form, contestType, member, isAts, startWeek, allTeam
  * Builds all Pick'em related questions on the form.
  */
 function buildPickemQuestions(ss, form, gamePlan, config) {
-  let tiebreakerMatchup;
+  // Chosen once, up front. This previously fell out of the game loop below, which
+  // made the tiebreaker whichever game happened to be last in the game plan.
+  const tiebreakerGame = config.tiebreakerInclude ? getTiebreakerGame(gamePlan.games) : null;
+  if (config.tiebreakerInclude && !tiebreakerGame) {
+    Logger.log(`⚠️ Tiebreakers are enabled but no tiebreaker game could be chosen for week ${gamePlan.week}`);
+  }
   Logger.log(`🏈 Building Pick'em questions...`);
   gamePlan.games.forEach(game => {
     let item = form.addMultipleChoiceItem();
@@ -4689,10 +4835,6 @@ function buildPickemQuestions(ss, form, gamePlan, config) {
     let helpText = `${mnf ? 'Monday Night Football' : game.dayName} at ${formatTime(game.hour, game.minute)}`;
     if (config.pickemsAts && game.spread) helpText += `  | ↔️ Spread: ${game.spread}`;
     if (game.bonus > 1) title += ` (${game.bonus == 3 ? '3️⃣' : '2️⃣'}x Bonus)`;
-    if (config.tiebreakerInclude) {
-      tiebreakerMatchup = `${game.awayTeamLocation} ${game.awayTeamName} at ${game.homeTeamLocation} ${game.homeTeamName}`;
-      tiebreakerOverUnder = game.overUnder;
-    }
     item.setTitle(title)
       .setHelpText(helpText)
       .setChoices([
@@ -4700,24 +4842,43 @@ function buildPickemQuestions(ss, form, gamePlan, config) {
         item.createChoice(`${!config.hideEmojis ? ' ' + LEAGUE_DATA[game.homeTeam].mascot: ''} ${game.homeTeam}`)]) // + LEAGUE_DATA[game.homeTeam].colors_emoji 
       .showOtherOption(false)
       .setRequired(true);
-    ss.toast(`Added pick 'ems question of ${tiebreakerMatchup}`,`${LEAGUE_DATA[game.awayTeam].mascot}@${LEAGUE_DATA[game.homeTeam].mascot}`);
+    ss.toast(`Added pick 'ems question of ${game.awayTeam} @ ${game.homeTeam}`,`${LEAGUE_DATA[game.awayTeam].mascot}@${LEAGUE_DATA[game.homeTeam].mascot}`);
     Logger.log(`🏈 Pick 'Ems: ${LEAGUE_DATA[game.awayTeam].mascot}@${LEAGUE_DATA[game.homeTeam].mascot} created`);
   });
-  if (config.tiebreakerInclude) { // Excludes tiebreaker question if tiebreaker is disabled
-    let numberValidation = FormApp.createTextValidation()
+  if (config.tiebreakerInclude && tiebreakerGame) { // Excludes tiebreaker questions if tiebreakers are disabled
+    const tiebreakerMatchup = `${tiebreakerGame.awayTeamLocation} ${tiebreakerGame.awayTeamName} at ${tiebreakerGame.homeTeamLocation} ${tiebreakerGame.homeTeamName}`;
+    const tiebreakerOverUnder = tiebreakerGame.overUnder;
+    const mnf = tiebreakerGame.dayName === 'Monday';
+
+    const combinedValidation = FormApp.createTextValidation()
       .setHelpText('Input must be a whole number between 0 and 120')
       .requireWholeNumber()
       .requireNumberBetween(0,120)
       .build();
-      // Tiebreaker question
-    let helpText = `Combined points between ${tiebreakerMatchup}${config.overUnderInclude && tiebreakerOverUnder > 0 ? ' (betting line: ' + tiebreakerOverUnder + ')' : ''}`
+    const winnerValidation = FormApp.createTextValidation()
+      .setHelpText('Input must be a whole number between 0 and 100')
+      .requireWholeNumber()
+      .requireNumberBetween(0,100)
+      .build();
+
+    // TIEBREAKER 1 -- combined final score of both teams
+    let helpTextOne = `Combined points between ${tiebreakerMatchup}${config.overUnderInclude && tiebreakerOverUnder > 0 ? ' (betting line: ' + tiebreakerOverUnder + ')' : ''}`;
     form.addTextItem()
-      .setTitle('Tiebreaker')
-      .setHelpText(helpText)
+      .setTitle('Tiebreaker 1')
+      .setHelpText(helpTextOne)
       .setRequired(true)
-      .setValidation(numberValidation);
-    ss.toast(`Created tiebreaker question for ${tiebreakerMatchup}`,`⚖️ TIEBREAKER CREATED`);
-    Logger.log(`⚖️ Tiebreaker question created for ${tiebreakerMatchup}`);
+      .setValidation(combinedValidation);
+
+    // TIEBREAKER 2 -- points scored by the winning team of that same game
+    let helpTextTwo = `Points scored by the WINNING team in ${tiebreakerMatchup} (only used if Tiebreaker 1 is also tied)`;
+    form.addTextItem()
+      .setTitle('Tiebreaker 2')
+      .setHelpText(helpTextTwo)
+      .setRequired(true)
+      .setValidation(winnerValidation);
+
+    ss.toast(`Created both tiebreaker questions for ${tiebreakerGame.awayTeam} @ ${tiebreakerGame.homeTeam}`,`⚖️ TIEBREAKERS CREATED`);
+    Logger.log(`⚖️ Two tiebreaker questions created for the ${mnf ? 'late MNF game' : 'last game of the week'}: ${tiebreakerMatchup}`);
   }
   if(!config.commentsExclude) { // Excludes comment question if comments are disabled
     form.addTextItem()
@@ -5208,10 +5369,12 @@ function executePickImport(week, importOnlyStartedGames) {
       });
       // --- Prepare Data for Writing (Unchanged) ---
       const picksRange = ss.getRangeByName(`${LEAGUE}_PICKS_${week}`);
-      let tiebreakerRange, tiebreakers;
+      let tiebreakerRange, tiebreakers, tiebreaker2Range, tiebreakers2;
       if (config.tiebreakerInclude) {
         tiebreakerRange = ss.getRangeByName(`${LEAGUE}_TIEBREAKER_${week}`);
         if (tiebreakerRange) tiebreakers = tiebreakerRange.getValues();
+        tiebreaker2Range = ss.getRangeByName(`${LEAGUE}_TIEBREAKER2_${week}`);
+        if (tiebreaker2Range) tiebreakers2 = tiebreaker2Range.getValues();
       }
       let commentRange, comments;
       if (!config.commentsExclude) {
@@ -5257,13 +5420,15 @@ function executePickImport(week, importOnlyStartedGames) {
             }
           }
         }
-        if (picks.tiebreaker) tiebreakers[rowIndex][0] = picks.tiebreaker;
+        if (picks.tiebreaker && tiebreakers) tiebreakers[rowIndex][0] = picks.tiebreaker;
+        if (picks.tiebreaker2 && tiebreakers2) tiebreakers2[rowIndex][0] = picks.tiebreaker2;
         if (picks.comments) comments[rowIndex][0] = picks.comments;
       }
       
       // --- 4. Write Data Back to the Sheet (Unchanged) ---
       picksRange.setValues(picksData);
-      if (!importOnlyStartedGames && config.tiebreakerInclude) tiebreakerRange.setValues(tiebreakers);
+      if (!importOnlyStartedGames && config.tiebreakerInclude && tiebreakerRange && tiebreakers) tiebreakerRange.setValues(tiebreakers);
+      if (!importOnlyStartedGames && config.tiebreakerInclude && tiebreaker2Range && tiebreakers2) tiebreaker2Range.setValues(tiebreakers2);
       if (!config.commentsExclude) commentRange.setValues(comments);
       const text = `Successfully imported Pick 'Em data into week '${week}' sheet.`;
       Logger.log(`✅ ${text}`);
@@ -5430,7 +5595,7 @@ function recordSurvElimResponses(parsedPicks, memberData, week, survInclude, eli
 // You will also need this small helper function (modified from a previous version)
 function getStartedGames() {
   try {
-    const response = UrlFetchApp.fetch(SCOREBOARD);
+    const response = espnFetch(SCOREBOARD);
     const data = JSON.parse(response.getContentText()).events;
     // An empty set is fine, as it is used to filter out games that are past kickoff and will not be imported
     const startedGames = new Set();
@@ -5596,6 +5761,7 @@ function parseAllPicksFromSheet(sheet, memberData) {
   
   const survivorRegex = /survivor/i;
   const eliminatorRegex = /eliminator/i;
+  const tiebreaker2Regex = /tiebreaker\s*2/i; // must be tested before the generic one below
   const tiebreakerRegex = /tiebreaker/i;
   const commentsRegex = /comments/i;
   const pickemRegex = / at /i;
@@ -5616,6 +5782,7 @@ function parseAllPicksFromSheet(sheet, memberData) {
       survivor: null,
       eliminator: null,
       tiebreaker: null,
+      tiebreaker2: null,
       comments: ''
     };
 
@@ -5635,6 +5802,8 @@ function parseAllPicksFromSheet(sheet, memberData) {
           userPicks.survivor = answer;
         } else if (eliminatorRegex.test(question) && answer) {
           userPicks.eliminator = answer;
+        } else if (tiebreaker2Regex.test(question)) {
+          userPicks.tiebreaker2 = answer;
         } else if (tiebreakerRegex.test(question)) {
           userPicks.tiebreaker = answer;
         } else if (pickemRegex.test(question) && answer) {
@@ -5655,7 +5824,7 @@ function parseAllPicksFromSheet(sheet, memberData) {
  */
 function getInvalidPickMatchups() {
   try {
-    const response = UrlFetchApp.fetch(SCOREBOARD); // Your global SCOREBOARD constant
+    const response = espnFetch(SCOREBOARD); // Your global SCOREBOARD constant
     const data = JSON.parse(response.getContentText()).events;
     const pastGames = [];
     
@@ -8445,6 +8614,8 @@ function allFormulasUpdate(ss){
 
     sheet = ss.getSheetByName('WINNERS');
     winnersFormulas(weeks,sheet);
+
+    // Wkly Consensus now holds dollars written by updatePayouts(), not formulas -- left alone here
   }
 }
 
@@ -8540,7 +8711,8 @@ function weeklySheet(ss,week,config,forms,memberData,displayEmpty,rebuild) {
   const outcomeMarginRow = summaryRow + 3; // Row for margins
   const spreadOutcomeRow = summaryRow + 4; // Row for determining which team was the corret pick when including the spread
   const bonusRow = summaryRow + 5; // Row for adding bonus drop-downs
-  const rows = bonusRow; // Declare row variable, unnecessary, but easier to work with  
+  const consensusRow = summaryRow + 6; // Pool 2: the crowd's majority pick for each matchup
+  const rows = consensusRow; // Declare row variable, unnecessary, but easier to work with  
   const spreadToBonusRowCount = bonusRow - spreadRow; // Bottom area for use when highlighting for bonus presence
   let columns;
   
@@ -8550,20 +8722,21 @@ function weeklySheet(ss,week,config,forms,memberData,displayEmpty,rebuild) {
   let maxCols = sheet.getMaxColumns();
   
   // DATA GATHERING IF DATA RESTORE ACTIVE
-  let commentCol, paidCol, tiebreakerCol = -1;
+  let commentCol, paidCol, tiebreakerCol = -1, tiebreaker2Col = -1;
   
   sheet.getRange(entryRowStart,1,totalMembers,1).setValues(members); 
 
   // Setting header values
-  let headers = [`WEEK ${week}`,'⭐','🥇','💯','🎲','📊'];
-  let subHeaders = [`${matchups} ${LEAGUE} Matchups`,'Picks','Rank','Percent','Chances','']; // One blank for sparkline cell, will be merged
-  let fontSizes = [18,16,16,16,16,16];
-  let subFontSizes = [9,7,7,7,7,7];
+  let headers = [`WEEK ${week}`,'⭐','🥇','💯','🤝','🎲','📊'];
+  let subHeaders = [`${matchups} ${LEAGUE} Matchups`,'Picks','Rank','Percent','Consensus','Chances','']; // One blank for sparkline cell, will be merged
+  let fontSizes = [18,16,16,16,16,16,16];
+  let subFontSizes = [9,7,7,7,7,7,7];
   const subHeadersPriorLength = subHeaders.length;
   let bottomHeaders = ['Group Stats'];
   const pointsCol = subHeaders.indexOf('Picks') + 1;
   const rankCol = subHeaders.indexOf('Rank') + 1;
   const percentCol = subHeaders.indexOf('Percent') + 1;
+  const consensusCol = subHeaders.indexOf('Consensus') + 1; // Pool 2: 1 = beat the crowd, 0 = did not
   const chancesCol = subHeaders.indexOf('Chances') + 1;
   const sparklinesCol = subHeaders.indexOf('Chances') + 2;
 
@@ -8573,7 +8746,8 @@ function weeklySheet(ss,week,config,forms,memberData,displayEmpty,rebuild) {
   sheet.getRange(outcomeMarginRow,1).setValue('Margin of Victory');
   sheet.getRange(spreadOutcomeRow,1).setValue('Winner Against the Spread');
   sheet.getRange(bonusRow,1).setValue('Bonus');
-  let widths = [130,50,50,50,50,50];
+  sheet.getRange(consensusRow,1).setValue('Consensus pick');
+  let widths = [130,50,50,50,50,50,50];
 
   
   // Setting headers for the week's matchups with format of 'AWAY' + '@' + 'HOME', then creating a data validation cell below each
@@ -8620,26 +8794,42 @@ function weeklySheet(ss,week,config,forms,memberData,displayEmpty,rebuild) {
   const finalMatchupCol = headers.length;
 
   if (config.tiebreakerInclude) {
-    Logger.log(`⚖️ Tiebreakers included in form; creating column`);
+    Logger.log(`⚖️ Tiebreakers included in form; creating two tiebreaker columns and their difference columns`);
+    // TIEBREAKER 1 -- combined score of the tiebreaker game
     headers.push('⚖️'); // Omitted if tiebreakers are removed
-    subHeaders.push(`Tiebreaker`);
+    subHeaders.push(`Tiebreaker 1`);
     widths.push(50);
     fontSizes.push(16);
     subFontSizes.push(7);
     tiebreakerCol = headers.length;
     headers.push('📏');
-    subHeaders.push(`Difference`);
+    subHeaders.push(`Difference 1`);
     widths.push(50);
     fontSizes.push(16);
     subFontSizes.push(7);
-    sheet.getRange(matchupRow,tiebreakerCol).setNote(`Displays each member's tiebreaker value provided as the combined score between the final game of the week`);
-    sheet.getRange(matchupRow,tiebreakerCol+1).setNote(`The net difference between tiebreaker submitted and actual tiebreaker (in row ${outcomeRow}, column ${tiebreakerCol})`);
+    sheet.getRange(matchupRow,tiebreakerCol).setNote(`Each member's guess at the combined score of the tiebreaker game (the late Monday night game, or the last game of a playoff week)`);
+    sheet.getRange(matchupRow,tiebreakerCol+1).setNote(`The net difference between the combined score submitted and the actual combined score (in row ${outcomeRow}, column ${tiebreakerCol})`);
+
+    // TIEBREAKER 2 -- winning team's score in the same game, only used if TB1 ties
+    headers.push('🏁');
+    subHeaders.push(`Tiebreaker 2`);
+    widths.push(50);
+    fontSizes.push(16);
+    subFontSizes.push(7);
+    tiebreaker2Col = headers.length;
+    headers.push('📏');
+    subHeaders.push(`Difference 2`);
+    widths.push(50);
+    fontSizes.push(16);
+    subFontSizes.push(7);
+    sheet.getRange(matchupRow,tiebreaker2Col).setNote(`Each member's guess at the WINNING team's score in the tiebreaker game, used only when Tiebreaker 1 is also tied`);
+    sheet.getRange(matchupRow,tiebreaker2Col+1).setNote(`The net difference between the winning team score submitted and the actual winning score (in row ${outcomeRow}, column ${tiebreaker2Col})`);
   } else {
     Logger.log(`🚫 No tiebreakers included in form`);
   }
 
   headers.push('🏆');
-  subHeaders.push(`Win`); // Replaced with formula later
+  subHeaders.push(`Place`); // Finishing place, written by updatePayouts() once the week is scored
   widths.push(50);
   fontSizes.push(16);
   subFontSizes.push(7);
@@ -8717,6 +8907,7 @@ function weeklySheet(ss,week,config,forms,memberData,displayEmpty,rebuild) {
   // Note and subtitle setting
   sheet.getRange(matchupRow,pointsCol).setNote(config.bonusInclude ? `The number of correct points using bonus multipliers` : `The current amount of correct picks on the week`);
   sheet.getRange(matchupRow,rankCol).setNote(`Current weekly rank of each member`);
+  sheet.getRange(matchupRow,consensusCol).setNote(`1 when a member beat the group's consensus picks for the week, 0 when they did not. Matching the consensus exactly does not count as beating it. Scored on raw correct picks -- the weekly bonus game does not count here. A game the NFL ends in a tie is a freebie worth +1 to every member and to the consensus. When members split 50/50 on a game the consensus has no pick (shown as SPLIT) and scores nothing there.`);
   sheet.getRange(matchupRow,percentCol).setNote(config.bonusInclude ? `Percent of picks correct (disregards bonus multipliers)` : `Percent of picks correct`);
   sheet.getRange(matchupRow,chancesCol).setNote(config.pickemsAts ? `Chance to finish with the most ${config.bonusInclude ? 'points':'correct picks'} on the week, accounts for spread probabilities${config.tiebreakerInclude ? ' but does not consider tiebreakers ' : ''}` : `Chance to finish with the most ${config.bonusInclude ? 'points':'correct picks'} on the week`);
   
@@ -8747,16 +8938,28 @@ function weeklySheet(ss,week,config,forms,memberData,displayEmpty,rebuild) {
 
   if (config.tiebreakerInclude) {
     ss.setNamedRange(`${LEAGUE}_TIEBREAKER_${week}`,sheet.getRange(entryRowStart,tiebreakerCol,totalMembers,1));
-    ss.setNamedRange(`${LEAGUE}_TIEBREAKER_${week}_OUTCOME`,sheet.getRange(outcomeRow,tiebreakerCol)); // Tiebreaker Outcome
+    ss.setNamedRange(`${LEAGUE}_TIEBREAKER_${week}_OUTCOME`,sheet.getRange(outcomeRow,tiebreakerCol)); // Tiebreaker 1 Outcome
     let validRule = SpreadsheetApp.newDataValidation()
       .requireNumberBetween(0,150)
-      .setHelpText('Must be an integer between 0 and 120')
+      .setHelpText('Must be an integer between 0 and 150')
       .build();
     sheet.getRange(outcomeRow,tiebreakerCol).setDataValidation(validRule);
+
+    ss.setNamedRange(`${LEAGUE}_TIEBREAKER2_${week}`,sheet.getRange(entryRowStart,tiebreaker2Col,totalMembers,1));
+    ss.setNamedRange(`${LEAGUE}_TIEBREAKER2_${week}_OUTCOME`,sheet.getRange(outcomeRow,tiebreaker2Col)); // Tiebreaker 2 Outcome
+    let validRule2 = SpreadsheetApp.newDataValidation()
+      .requireNumberBetween(0,100)
+      .setHelpText(`Must be an integer between 0 and 100 (the winning team's score)`)
+      .build();
+    sheet.getRange(outcomeRow,tiebreaker2Col).setDataValidation(validRule2);
   }
   if (!config.commentsExclude) {
     ss.setNamedRange(`COMMENTS_${week}`,sheet.getRange(entryRowStart,commentCol,totalMembers,1));
   }
+
+  // Pool 2 ranges: the per-member 1/0 flag column, and the crowd's pick for each matchup
+  ss.setNamedRange(`${LEAGUE}_CONSENSUS_${week}`,sheet.getRange(entryRowStart,consensusCol,totalMembers,1));
+  ss.setNamedRange(`${LEAGUE}_CONSENSUS_PICKS_${week}`,sheet.getRange(consensusRow,firstMatchupCol,1,matchups));
 
   const numPlayers = entryRowEnd - entryRowStart + 1;
   const effectiveOutcomeRow = isAts ? spreadOutcomeRow : outcomeRow;
@@ -8781,7 +8984,9 @@ function weeklySheet(ss,week,config,forms,memberData,displayEmpty,rebuild) {
   const allBonusRange = `R${bonusRow}C${firstMatchupCol}:R${bonusRow}C${finalMatchupCol}`;
 
   // Points Formula (using efficient SUMPRODUCT)
-  const pointsFormula = `=IFERROR(IF(COUNTA(${outcomesRange}) > 0, SUMPRODUCT(--(${picksRange}=${outcomesRange}), ${allBonusRange}),))`;
+  // A game the NFL ties is a freebie for everyone, so it is added here too -- otherwise this
+  // column would read one lower than the points the weekly placement actually ranks on.
+  const pointsFormula = `=IFERROR(IF(COUNTA(${outcomesRange}) > 0, SUMPRODUCT(--(${picksRange}=${outcomesRange}), ${allBonusRange}) + SUMPRODUCT(--(${outcomesRange}="TIE"), ${allBonusRange}),))`;
 
   // Rank Formula
   const rankFormula = `=IFERROR(IF(NOT(ISBLANK(${pointsCell})), RANK(${pointsCell}, ${allPointsRange}, 0),""))`;
@@ -8798,8 +9003,9 @@ function weeklySheet(ss,week,config,forms,memberData,displayEmpty,rebuild) {
   // Wildcard Formula (uses external function) for all rows
   const wildCardFormula = `=calculateWildcardScore(${allPicksRange})`;
 
-  // Tiebreaker Difference Formula
+  // Tiebreaker Difference Formulas (one per tiebreaker column, each reads the cell to its left)
   const tiebreakerDiffFormula = `=IFERROR(IF(OR(ISBLANK(R[0]C[-1]), ISBLANK(R${outcomeRow}C${tiebreakerCol})),, ABS(R[0]C[-1] - R${outcomeRow}C${tiebreakerCol})))`;
+  const tiebreaker2DiffFormula = `=IFERROR(IF(OR(ISBLANK(R[0]C[-1]), ISBLANK(R${outcomeRow}C${tiebreaker2Col})),, ABS(R[0]C[-1] - R${outcomeRow}C${tiebreaker2Col})))`;
 
   // Similar Pickers Formula
   const similarPickersFormula = `=IFERROR(IF(ISBLANK(R[0]C${firstMatchupCol}),, TRANSPOSE(ARRAYFORMULA({(${matchups} - QUERY({R${entryRowStart}C1:R${entryRowEnd}C1, ARRAYFORMULA(MMULT(IF(${allPicksRange}=${picksRange},1,0),TRANSPOSE(ARRAYFORMULA(COLUMN(${picksRange})^0))))}, "select Col2 where Col1 <> '"&R[0]C1&"' order by Col2 desc, Col1 asc limit ${diffCount}")) & ": " & QUERY({R${entryRowStart}C1:R${entryRowEnd}C1, ARRAYFORMULA(MMULT(IF(${allPicksRange}=${picksRange},1,0),TRANSPOSE(ARRAYFORMULA(COLUMN(${picksRange})^0))))}, "select Col1 where Col1 <> '"&R[0]C1&"' order by Col2 desc, Col1 asc limit ${diffCount}")}))))`;
@@ -8819,8 +9025,27 @@ function weeklySheet(ss,week,config,forms,memberData,displayEmpty,rebuild) {
   // Apply conditional formulas
   if (config.tiebreakerInclude) {
     sheet.getRange(entryRowStart, tiebreakerCol + 1, numPlayers).setFormulaR1C1(tiebreakerDiffFormula);
-    
-    const tiebreakerWinnerFormula = `=IFERROR(IF(COUNTA(R${outcomeRow}C${firstMatchupCol}:R${outcomeRow}C${finalMatchupCol})=VALUE(REGEXEXTRACT(R${subHeaderRow}C1,"[0-9]+")), ARRAYFORMULA(IF(COUNTIF(ARRAY_CONSTRAIN({R[0]C${pointsCol},R[0]C${tiebreakerCol+1}}=FILTER(FILTER({${allPointsRange},R${entryRowStart}C${tiebreakerCol+1}:R${entryRowEnd}C${tiebreakerCol+1}},${allPointsRange}=MAX(${allPointsRange})),FILTER(R${entryRowStart}C${tiebreakerCol+1}:R${entryRowEnd}C${tiebreakerCol+1},${allPointsRange}=MAX(${allPointsRange}))=MIN(FILTER(R${entryRowStart}C${tiebreakerCol+1}:R${entryRowEnd}C${tiebreakerCol+1},${allPointsRange}=MAX(${allPointsRange})))),1,2),TRUE)=2,1,0))),)`;
+    sheet.getRange(entryRowStart, tiebreaker2Col + 1, numPlayers).setFormulaR1C1(tiebreaker2DiffFormula);
+
+    // WIN CASCADE: most correct -> closest combined score (TB1) -> closest winning
+    // team score (TB2). Each level is skipped while its outcome cell is still blank,
+    // and anyone who survives all three levels gets a 1, so unbroken ties produce
+    // multiple winners and the weekly pot gets split.
+    const weekComplete = `COUNTA(R${outcomeRow}C${firstMatchupCol}:R${outcomeRow}C${finalMatchupCol})=VALUE(REGEXEXTRACT(R${subHeaderRow}C1,"[0-9]+"))`;
+    const tb1Outcome = `R${outcomeRow}C${tiebreakerCol}`;
+    const tb2Outcome = `R${outcomeRow}C${tiebreaker2Col}`;
+    const tb1Diffs = `R${entryRowStart}C${tiebreakerCol+1}:R${entryRowEnd}C${tiebreakerCol+1}`;
+    const tb2Diffs = `R${entryRowStart}C${tiebreaker2Col+1}:R${entryRowEnd}C${tiebreaker2Col+1}`;
+    const myDiff1 = `R[0]C${tiebreakerCol+1}`;
+    const myDiff2 = `R[0]C${tiebreaker2Col+1}`;
+    const bestPoints = `MAX(${allPointsRange})`;
+    const minDiff1 = `MIN(FILTER(${tb1Diffs},${allPointsRange}=${bestPoints}))`;
+    const minDiff2 = `MIN(FILTER(${tb2Diffs},(${allPointsRange}=${bestPoints})*(${tb1Diffs}=${minDiff1})))`;
+    const atTopPoints = `${pointsCell}=${bestPoints}`;
+    const passesTb1 = `IF(ISBLANK(${tb1Outcome}),TRUE,${myDiff1}=${minDiff1})`;
+    const passesTb2 = `IF(OR(ISBLANK(${tb1Outcome}),ISBLANK(${tb2Outcome})),TRUE,${myDiff2}=${minDiff2})`;
+
+    const tiebreakerWinnerFormula = `=IFERROR(IF(${weekComplete}, IF(AND(${atTopPoints},${passesTb1},${passesTb2}),1,0),),)`;
     sheet.getRange(allWinnersRange).setFormulaR1C1(tiebreakerWinnerFormula);
 
   } else {
@@ -8851,6 +9076,34 @@ function weeklySheet(ss,week,config,forms,memberData,displayEmpty,rebuild) {
   // Formula for the Home/Away split summary in the summary row
   const homeAwaySplitFormula = `=IFERROR(IF(COUNTA(R${entryRowStart}C[0]:R${entryRowEnd}C[0])=0,, LET(total_picks, COUNTA(R${entryRowStart}C[0]:R${entryRowEnd}C[0]), home_team, REGEXEXTRACT(R${matchupRow}C[0], "[A-Z]{2,3}$"), home_picks, COUNTIF(R${entryRowStart}C[0]:R${entryRowEnd}C[0], home_team), away_team, REGEXEXTRACT(R${matchupRow}C[0], "^[A-Z]{2,3}"), IF(home_picks = total_picks/2, "SPLIT"&CHAR(10)&"50%", IF(home_picks > total_picks/2, home_team & CHAR(10) & ROUND(100*home_picks/total_picks,0)&"%", away_team & CHAR(10) & ROUND(100*(total_picks-home_picks)/total_picks,0)&"%")))))`;
   sheet.getRange(summaryRow, firstMatchupCol, 1, matchups).setFormulaR1C1(homeAwaySplitFormula);
+
+  // ---- POOL 2: WEEKLY CONSENSUS ----------------------------------------------
+  // The crowd's pick for each matchup: whichever team the majority took, or "TIE" on a 50/50.
+  const consensusPickFormula = `=IFERROR(IF(COUNTA(R${entryRowStart}C[0]:R${entryRowEnd}C[0])=0,, LET(away, REGEXEXTRACT(R${matchupRow}C[0],"^[A-Z]{2,3}"), home, REGEXEXTRACT(R${matchupRow}C[0],"[A-Z]{2,3}$"), a, COUNTIF(R${entryRowStart}C[0]:R${entryRowEnd}C[0], away), h, COUNTIF(R${entryRowStart}C[0]:R${entryRowEnd}C[0], home), IF(a>h, away, IF(h>a, home, "SPLIT")))))`;
+  sheet.getRange(consensusRow, firstMatchupCol, 1, matchups).setFormulaR1C1(consensusPickFormula);
+
+  const consensusPicksRange = `R${consensusRow}C${firstMatchupCol}:R${consensusRow}C${finalMatchupCol}`;
+  const outcomesRowRange = `R${outcomeRow}C${firstMatchupCol}:R${outcomeRow}C${finalMatchupCol}`;
+  // Two separate situations, per the pool rules:
+  //   * A real NFL tie (outcome recorded as "TIE") is a freebie: nobody could have picked it, so
+  //     every player AND the consensus each bank a point. It cannot change who beats the crowd,
+  //     which is the point -- it neither helps nor hurts anyone.
+  //   * A 50/50 pick split leaves the consensus with no pick for that game (shown as "SPLIT"),
+  //     so the crowd simply scores nothing there while players score normally.
+  const tieGameAdjustment = `SUMPRODUCT(--(${outcomesRowRange}="TIE"))`;
+  const consensusRawCorrect = `SUMPRODUCT(--(${consensusPicksRange}=${outcomesRowRange}),--(${outcomesRowRange}<>""),--(${outcomesRowRange}<>"TIE"))`;
+
+  // Crowd's adjusted correct count, shown in the Picks column of the consensus row
+  sheet.getRange(consensusRow, pointsCol).setFormulaR1C1(`=IFERROR(IF(COUNTA(${outcomesRowRange})=0,, ${consensusRawCorrect} + ${tieGameAdjustment}))`);
+  // How many members beat the crowd — the divisor when the weekly consensus pot is split
+  sheet.getRange(consensusRow, consensusCol).setFormulaR1C1(`=IFERROR(IF(COUNTA(${outcomesRowRange})=0,, COUNTIF(R${entryRowStart}C${consensusCol}:R${entryRowEnd}C${consensusCol},1)))`);
+
+  // Per-member flag. Raw correct is recomputed here rather than read from the Picks column so that
+  // bonus multipliers, if they are ever switched on, cannot distort the consensus comparison.
+  const playerRawCorrect = `SUMPRODUCT(--(R[0]C${firstMatchupCol}:R[0]C${finalMatchupCol}=${outcomesRowRange}),--(${outcomesRowRange}<>""),--(${outcomesRowRange}<>"TIE"))`;
+  const weekSettled = `COUNTA(${outcomesRowRange})=VALUE(REGEXEXTRACT(R${subHeaderRow}C1,"[0-9]+"))`;
+  const consensusFlagFormula = `=IFERROR(IF(${weekSettled}, IF(ISBLANK(R[0]C${firstMatchupCol}),, IF(${playerRawCorrect} + ${tieGameAdjustment} > R${consensusRow}C${pointsCol}, 1, 0)),),)`;
+  sheet.getRange(entryRowStart, consensusCol, numPlayers).setFormulaR1C1(consensusFlagFormula);
 
   // Formula to calculate the winner based on the spread
   const spreadOutcomeFormula = `=IFERROR(IF(OR(ISBLANK(R${outcomeRow}C[0]), ISBLANK(R${outcomeMarginRow}C[0])),, LET(
@@ -8892,15 +9145,17 @@ function weeklySheet(ss,week,config,forms,memberData,displayEmpty,rebuild) {
   sheet.getRange(summaryRow, wildcardCol).setFormulaR1C1(`=IFERROR(IF(SUM(R${entryRowStart}C[0]:R${entryRowEnd}C[0])>0, ROUND(AVERAGE(R${entryRowStart}C[0]:R${entryRowEnd}C[0]),1),),)`);
 
   // Home/Away Bias summary formulas
-  sheet.getRange(summaryRow, 5).setFormulaR1C1(`=IFERROR(IF(COUNTA(${allPicksRange})>10,"AWAY"&CHAR(10)&ROUND(100*(SUMPRODUCT(ARRAYFORMULA(--(REGEXEXTRACT(R${matchupRow}C${firstMatchupCol}:R${matchupRow}C${finalMatchupCol},"^[A-Z]{2,3}")=${allPicksRange}))))/COUNTA(${allPicksRange}),1)&"%","AWAY"),"AWAY")`);
-  sheet.getRange(summaryRow, 6).setFormulaR1C1(`=IFERROR(IF(COUNTA(${allPicksRange})>10,"HOME"&CHAR(10)&ROUND(100*(SUMPRODUCT(ARRAYFORMULA(--(REGEXEXTRACT(R${matchupRow}C${firstMatchupCol}:R${matchupRow}C${finalMatchupCol},"[A-Z]{2,3}$")=${allPicksRange}))))/COUNTA(${allPicksRange}),1)&"%","HOME"),"HOME")`);
+  sheet.getRange(summaryRow, chancesCol).setFormulaR1C1(`=IFERROR(IF(COUNTA(${allPicksRange})>10,"AWAY"&CHAR(10)&ROUND(100*(SUMPRODUCT(ARRAYFORMULA(--(REGEXEXTRACT(R${matchupRow}C${firstMatchupCol}:R${matchupRow}C${finalMatchupCol},"^[A-Z]{2,3}")=${allPicksRange}))))/COUNTA(${allPicksRange}),1)&"%","AWAY"),"AWAY")`);
+  sheet.getRange(summaryRow, sparklinesCol).setFormulaR1C1(`=IFERROR(IF(COUNTA(${allPicksRange})>10,"HOME"&CHAR(10)&ROUND(100*(SUMPRODUCT(ARRAYFORMULA(--(REGEXEXTRACT(R${matchupRow}C${firstMatchupCol}:R${matchupRow}C${finalMatchupCol},"[A-Z]{2,3}$")=${allPicksRange}))))/COUNTA(${allPicksRange}),1)&"%","HOME"),"HOME")`);
   
   // Tiebreaker and Winner columns
   if (config.tiebreakerInclude) {
-    sheet.getRange(subHeaderRow, winCol).setFormulaR1C1(`=IF(COUNTIF(R${entryRowStart}C[0]:R${entryRowEnd}C[0],1)>1, "Tie", "Win")`);
+    sheet.getRange(subHeaderRow, winCol).setFormulaR1C1(`=IF(COUNTIF(R${entryRowStart}C[0]:R${entryRowEnd}C[0],1)>1, "Tie", "Place")`);
     sheet.getRange(summaryRow, winCol).setFormulaR1C1(`=IFERROR(IF(NOT(ISBLANK(R${summaryRow}C${tiebreakerCol})), IF(COUNTIF(R${entryRowStart}C[0]:R${entryRowEnd}C[0],1)>1, COUNTIF(R${entryRowStart}C[0]:R${entryRowEnd}C[0],1)&"-WAY"&CHAR(10)&"TIE",),),)`);
     sheet.getRange(summaryRow, tiebreakerCol).setFormulaR1C1(`=IFERROR(IF(SUM(R${entryRowStart}C[0]:R${entryRowEnd}C[0])>0, "AVG"&CHAR(10)&ROUND(AVERAGE(R${entryRowStart}C[0]:R${entryRowEnd}C[0]),1),),)`);
     sheet.getRange(summaryRow, tiebreakerCol + 1).setFormulaR1C1(`=IFERROR(IF(SUM(R${entryRowStart}C[0]:R${entryRowEnd}C[0])>0, "AVG"&CHAR(10)&ROUND(AVERAGE(R${entryRowStart}C[0]:R${entryRowEnd}C[0]),1),),)`);
+    sheet.getRange(summaryRow, tiebreaker2Col).setFormulaR1C1(`=IFERROR(IF(SUM(R${entryRowStart}C[0]:R${entryRowEnd}C[0])>0, "AVG"&CHAR(10)&ROUND(AVERAGE(R${entryRowStart}C[0]:R${entryRowEnd}C[0]),1),),)`);
+    sheet.getRange(summaryRow, tiebreaker2Col + 1).setFormulaR1C1(`=IFERROR(IF(SUM(R${entryRowStart}C[0]:R${entryRowEnd}C[0])>0, "AVG"&CHAR(10)&ROUND(AVERAGE(R${entryRowStart}C[0]:R${entryRowEnd}C[0]),1),),)`);
   } else {
     sheet.getRange(summaryRow, winCol).setFormulaR1C1(`=IFERROR(IF(COUNTA(R${outcomeRow}C${firstMatchupCol}:R${outcomeRow}C${finalMatchupCol})=VALUE(REGEXEXTRACT(R${subHeaderRow}C1,"[0-9]+")), IF(COUNTIF(R${entryRowStart}C[0]:R${entryRowEnd}C[0],1)>1, COUNTIF(R${entryRowStart}C[0]:R${entryRowEnd}C[0],1)&"-WAY"&CHAR(10)&"TIE", "DONE"),),)`);
     sheet.getRange(subHeaderRow, winCol).setFormulaR1C1(`=IFERROR(IF(COUNTA(R${outcomeRow}C${firstMatchupCol}:R${outcomeRow}C${finalMatchupCol})=VALUE(REGEXEXTRACT(R${subHeaderRow}C1,"[0-9]+")), IF(COUNTIF(R${entryRowStart}C[0]:R${entryRowEnd}C[0],1)=0, "Tie", "Win"), "Win"),)`);
@@ -9052,20 +9307,18 @@ function weeklySheet(ss,week,config,forms,memberData,displayEmpty,rebuild) {
   // WINNER COLUMN RULE
   range = sheet.getRange(entryRowStart,winCol,totalMembers,1);
   ss.setNamedRange(`WIN_${week}`,range);
-  let formatRuleNotWinner = SpreadsheetApp.newConditionalFormatRule()
-    .whenNumberNotEqualTo(1)
-    .setBackground('#FFFFFF')
-    .setFontColor('#FFFFFF')
-    .setRanges([range])
-    .build();     
-  formatRules.push(formatRuleNotWinner);
-  let formatRuleWinner = SpreadsheetApp.newConditionalFormatRule()
-    .whenNumberEqualTo(1)
-    .setBackground('#75F0A1')
-    .setFontColor('#75F0A1')
-    .setRanges([range])
-    .build();
-  formatRules.push(formatRuleWinner);  
+  // Paid places are shaded from strongest to faintest; anything outside the money stays plain.
+  // "Place" is written by updatePayouts() when a week closes, so 1st here matches Wkly Payout.
+  const placeColors = hexGradient('#75F0A1','#FFFFFF',8);
+  for (let place = 1; place <= 7; place++) {
+    let placeRule = SpreadsheetApp.newConditionalFormatRule()
+      .whenNumberEqualTo(place)
+      .setBackground(placeColors[place - 1])
+      .setBold(place === 1)
+      .setRanges([range])
+      .build();
+    formatRules.push(placeRule);
+  }
   // WINNER NAME RULE
   range = sheet.getRange(entryRowStart,winCol,totalMembers,1);
   let formatRuleWinnerName = SpreadsheetApp.newConditionalFormatRule()
@@ -9110,82 +9363,102 @@ function weeklySheet(ss,week,config,forms,memberData,displayEmpty,rebuild) {
 
   // DIFFERENCE TIEBREAKER COLUMN FORMATTING
   if (config.tiebreakerInclude) {
-    let offsets = [1,3,5,10,15,20,20];
-    let offsetColors = hexGradient('#33FF7A','#FFFFFF',offsets.length);
-    for (let a = 0; a < offsets.length; a++) {
-      let rule;
-      if (a < (offsets.length - 1)) {
+    // Both tiebreaker columns get the same treatment
+    for (const tbCol of (tiebreaker2Col > 0 ? [tiebreakerCol, tiebreaker2Col] : [tiebreakerCol])) {
+      let offsets = [1,3,5,10,15,20,20];
+      let offsetColors = hexGradient('#33FF7A','#FFFFFF',offsets.length);
+      for (let a = 0; a < offsets.length; a++) {
+        let rule;
+        if (a < (offsets.length - 1)) {
+          rule = SpreadsheetApp.newConditionalFormatRule()
+            .whenFormulaSatisfied(`=if(not(isblank(indirect("R${outcomeRow}C[0]",false))),abs(indirect("R[0]C[0]",false)-indirect("R${outcomeRow}C[0]:R${outcomeRow}C[0]",false))<=${offsets[a]},)`)
+            .setBackground(offsetColors[a])
+            .setRanges([sheet.getRange(entryRowStart,tbCol,totalMembers,1)])
+            .build();
+        } else {
+          rule = SpreadsheetApp.newConditionalFormatRule()
+            .whenFormulaSatisfied(`=if(not(isblank(indirect("R${outcomeRow}C[0]",false))),abs(indirect("R[0]C[0]",false)-indirect("R${outcomeRow}C[0]:R${outcomeRow}C[0]",false))>${offsets[a]},)`)
+            .setBackground(offsetColors[a])
+            .setRanges([sheet.getRange(entryRowStart,tbCol,totalMembers,1)])
+            .build();        
+        }
+        formatRules.push(rule);
         rule = SpreadsheetApp.newConditionalFormatRule()
-          .whenFormulaSatisfied(`=if(not(isblank(indirect("R${outcomeRow}C[0]",false))),abs(indirect("R[0]C[0]",false)-indirect("R${outcomeRow}C[0]:R${outcomeRow}C[0]",false))<=${offsets[a]},)`)
+          .whenFormulaSatisfied(`=if(not(isblank(indirect("R${outcomeRow}C[0]",false))),abs(value(regexextract(indirect("R[0]C[0]",false),"[0-9]+"))-indirect("R${outcomeRow}C[0]:R${outcomeRow}C[0]",false))<=${offsets[a]},)`)
           .setBackground(offsetColors[a])
-          .setRanges([sheet.getRange(entryRowStart,tiebreakerCol,totalMembers,1)])
+          .setRanges([sheet.getRange(summaryRow,tbCol)])
           .build();
-      } else {
-        rule = SpreadsheetApp.newConditionalFormatRule()
-          .whenFormulaSatisfied(`=if(not(isblank(indirect("R${outcomeRow}C[0]",false))),abs(indirect("R[0]C[0]",false)-indirect("R${outcomeRow}C[0]:R${outcomeRow}C[0]",false))>${offsets[a]},)`)
-          .setBackground(offsetColors[a])
-          .setRanges([sheet.getRange(entryRowStart,tiebreakerCol,totalMembers,1)])
-          .build();        
+        formatRules.push(rule);
       }
-      formatRules.push(rule);
-      rule = SpreadsheetApp.newConditionalFormatRule()
-        .whenFormulaSatisfied(`=if(not(isblank(indirect("R${outcomeRow}C[0]",false))),abs(value(regexextract(indirect("R[0]C[0]",false),"[0-9]+"))-indirect("R${outcomeRow}C[0]:R${outcomeRow}C[0]",false))<=${offsets[a]},)`)
-        .setBackground(offsetColors[a])
-        .setRanges([sheet.getRange(summaryRow,tiebreakerCol)])
+      offsetColors = hexGradient('#FFFFFF','#666666',offsets.length);
+      for (let a = 0; a < offsets.length; a++) {
+        let rule;
+        let ruleOffsets;
+        if (a < (offsets.length - 1)) {
+          rule = SpreadsheetApp.newConditionalFormatRule()
+            .whenFormulaSatisfied(`=if(not(isblank(indirect("R${outcomeRow}C[-1]",false))),indirect("R[0]C[0]",false)<=${offsets[a]},)`)
+            .setBackground(offsetColors[a])
+            .setRanges([sheet.getRange(entryRowStart,tbCol+1,totalMembers,1)])
+            .build();
+          ruleOffsets = SpreadsheetApp.newConditionalFormatRule()
+            .whenFormulaSatisfied(`=if(not(isblank(indirect("R${outcomeRow}C[-1]",false))),value(regexextract(indirect("R[0]C[0]",false),"[0-9]+"))<=${offsets[a]},)`)
+            .setBackground(offsetColors[a])
+            .setRanges([sheet.getRange(summaryRow,tbCol+1)])
+            .build();
+        } else {
+          rule = SpreadsheetApp.newConditionalFormatRule()
+            .whenFormulaSatisfied(`=if(not(isblank(indirect("R${outcomeRow}C[-1]",false))),indirect("R[0]C[0]",false)>${offsets[a]},)`)
+            .setBackground(offsetColors[a])
+            .setRanges([sheet.getRange(entryRowStart,tbCol+1,totalMembers,1)])
+            .build();
+          ruleOffsets = SpreadsheetApp.newConditionalFormatRule()
+            .whenFormulaSatisfied(`=if(not(isblank(indirect("R${outcomeRow}C[-1]",false))),value(regexextract(indirect("R[0]C[0]",false),"[0-9]+"))>${offsets[a]},)`)
+            .setBackground(offsetColors[a])
+            .setRanges([sheet.getRange(summaryRow,tbCol+1)])
+            .build();              
+        }
+        formatRules.push(rule);
+        formatRules.push(ruleOffsets);
+      }
+      // ADD ADDITIONAL COLOR VARIATION BASED ON TIEBREAKER VALUE PRESENT HERE
+      let formatRuleTiebreakerEmptyAndDone = SpreadsheetApp.newConditionalFormatRule()
+        .whenFormulaSatisfied(`=and(isblank(indirect("R[0]C[0]",false)),counta(indirect("R${outcomeRow}C${firstMatchupCol}:R${outcomeRow}C${finalMatchupCol}",false))>=columns(indirect("R${outcomeRow}C${firstMatchupCol}:R${outcomeRow}C${finalMatchupCol}",false)))`)
+        .setBackground("#FF3FC7")
+        .setRanges([sheet.getRange(outcomeRow,tbCol)])
         .build();
-      formatRules.push(rule);
+      formatRules.push(formatRuleTiebreakerEmptyAndDone);
+      let formatRuleTiebreakerEmpty = SpreadsheetApp.newConditionalFormatRule()
+        .whenCellEmpty()
+        .setBackground("#CCCCCC")
+        .setRanges([sheet.getRange(outcomeRow,tbCol)])
+        .build();
+      formatRules.push(formatRuleTiebreakerEmpty);
+      range = sheet.getRange(entryRowStart,tbCol,totalMembers,1);
+      let formatRuleDiff = SpreadsheetApp.newConditionalFormatRule()
+        .setGradientMaxpoint("#B7B7B7")
+        .setGradientMinpoint("#FFFFFF")
+        .setRanges([range])
+        .build();
+      formatRules.push(formatRuleDiff);
     }
-    offsetColors = hexGradient('#FFFFFF','#666666',offsets.length);
-    for (let a = 0; a < offsets.length; a++) {
-      let rule;
-      let ruleOffsets;
-      if (a < (offsets.length - 1)) {
-        rule = SpreadsheetApp.newConditionalFormatRule()
-          .whenFormulaSatisfied(`=if(not(isblank(indirect("R${outcomeRow}C[-1]",false))),indirect("R[0]C[0]",false)<=${offsets[a]},)`)
-          .setBackground(offsetColors[a])
-          .setRanges([sheet.getRange(entryRowStart,tiebreakerCol+1,totalMembers,1)])
-          .build();
-        ruleOffsets = SpreadsheetApp.newConditionalFormatRule()
-          .whenFormulaSatisfied(`=if(not(isblank(indirect("R${outcomeRow}C[-1]",false))),value(regexextract(indirect("R[0]C[0]",false),"[0-9]+"))<=${offsets[a]},)`)
-          .setBackground(offsetColors[a])
-          .setRanges([sheet.getRange(summaryRow,tiebreakerCol+1)])
-          .build();
-      } else {
-        rule = SpreadsheetApp.newConditionalFormatRule()
-          .whenFormulaSatisfied(`=if(not(isblank(indirect("R${outcomeRow}C[-1]",false))),indirect("R[0]C[0]",false)>${offsets[a]},)`)
-          .setBackground(offsetColors[a])
-          .setRanges([sheet.getRange(entryRowStart,tiebreakerCol+1,totalMembers,1)])
-          .build();
-        ruleOffsets = SpreadsheetApp.newConditionalFormatRule()
-          .whenFormulaSatisfied(`=if(not(isblank(indirect("R${outcomeRow}C[-1]",false))),value(regexextract(indirect("R[0]C[0]",false),"[0-9]+"))>${offsets[a]},)`)
-          .setBackground(offsetColors[a])
-          .setRanges([sheet.getRange(summaryRow,tiebreakerCol+1)])
-          .build();              
-      }
-      formatRules.push(rule);
-      formatRules.push(ruleOffsets);
-    }
-    // ADD ADDITIONAL COLOR VARIATION BASED ON TIEBREAKER VALUE PRESENT HERE
-    let formatRuleTiebreakerEmptyAndDone = SpreadsheetApp.newConditionalFormatRule()
-      .whenFormulaSatisfied(`=and(isblank(indirect("R[0]C[0]",false)),counta(indirect("R${outcomeRow}C${firstMatchupCol}:R${outcomeRow}C${finalMatchupCol}",false))>=columns(indirect("R${outcomeRow}C${firstMatchupCol}:R${outcomeRow}C${finalMatchupCol}",false)))`)
-      .setBackground("#FF3FC7")
-      .setRanges([sheet.getRange(outcomeRow,tiebreakerCol)])
-      .build();
-    formatRules.push(formatRuleTiebreakerEmptyAndDone);
-    let formatRuleTiebreakerEmpty = SpreadsheetApp.newConditionalFormatRule()
-      .whenCellEmpty()
-      .setBackground("#CCCCCC")
-      .setRanges([sheet.getRange(outcomeRow,tiebreakerCol)])
-      .build();
-    formatRules.push(formatRuleTiebreakerEmpty);
-    range = sheet.getRange(entryRowStart,tiebreakerCol,totalMembers,1);
-    let formatRuleDiff = SpreadsheetApp.newConditionalFormatRule()
-      .setGradientMaxpoint("#B7B7B7")
-      .setGradientMinpoint("#FFFFFF")
-      .setRanges([range])
-      .build();
-    formatRules.push(formatRuleDiff);
   }
+
+  // POOL 2 CONSENSUS COLUMN FORMATTING
+  range = sheet.getRange(entryRowStart,consensusCol,totalMembers,1);
+  let formatRuleBeatConsensus = SpreadsheetApp.newConditionalFormatRule()
+    .whenNumberEqualTo(1)
+    .setBackground('#75F0A1')
+    .setBold(true)
+    .setRanges([range])
+    .build();
+  formatRules.push(formatRuleBeatConsensus);
+  let formatRuleMissedConsensus = SpreadsheetApp.newConditionalFormatRule()
+    .whenNumberEqualTo(0)
+    .setBackground('#FFFFFF')
+    .setFontColor('#CCCCCC')
+    .setRanges([range])
+    .build();
+  formatRules.push(formatRuleMissedConsensus);
 
   // PREFERENCE COLOR SCHEMES
   let homeAwayPercents = [90,80,70,60,50];
@@ -9336,7 +9609,7 @@ function weeklySheet(ss,week,config,forms,memberData,displayEmpty,rebuild) {
     .setFontColor('white')
     .setFontSize(10);
   // Spread row to bonus row formatting
-  sheet.getRange(spreadRow,1,bonusRow-spreadRow+1,firstMatchupCol-1)
+  sheet.getRange(spreadRow,1,consensusRow-spreadRow+1,firstMatchupCol-1)
     .mergeAcross().setHorizontalAlignment('right');
   // Smaller spread values to fit widths
   sheet.getRange(spreadRow,1,1,maxCols).setFontSize(8);
@@ -9348,6 +9621,10 @@ function weeklySheet(ss,week,config,forms,memberData,displayEmpty,rebuild) {
     sheet.hideRows(bonusRow);
   }
 
+  // Consensus row reads as a summary line rather than a data row
+  sheet.getRange(consensusRow,1,1,maxCols).setBackground('#EDE7F6').setFontWeight('bold');
+  sheet.getRange(consensusRow,1).setNote(`The group's majority pick for each matchup, or "SPLIT" when members divide 50/50. The Picks column shows the consensus score for the week (raw correct picks, plus a freebie for any game the NFL ties); the Consensus column shows how many members beat it.`);
+
   if (!isAts) {
     sheet.hideRows(spreadRow);
     sheet.hideRows(outcomeMarginRow);
@@ -9357,8 +9634,8 @@ function weeklySheet(ss,week,config,forms,memberData,displayEmpty,rebuild) {
   sheet.setRowHeight(summaryRow,40);
   sheet.getRange(summaryRow,1,1,sheet.getMaxColumns()).setVerticalAlignment('middle');
   sheet.getRange(summaryRow,1,1,maxCols-diffCount).setBackground('#CCCCCC');
-  sheet.getRange(summaryRow,5).setBackground(awayColors[1]);
-  sheet.getRange(summaryRow,6).setBackground(homeColors[1]);
+  sheet.getRange(summaryRow,chancesCol).setBackground(awayColors[1]);
+  sheet.getRange(summaryRow,sparklinesCol).setBackground(homeColors[1]);
 
   // GROUP AVG POINTS/PICKS
   sheet.getRange(summaryRow,2).setFontSize(8).setBackground('#75F0A1');
@@ -9371,7 +9648,8 @@ function weeklySheet(ss,week,config,forms,memberData,displayEmpty,rebuild) {
     .mergeAcross();
 
   if (config.tiebreakerInclude) {
-    sheet.getRange(outcomeRow,tiebreakerCol).setNote('Enter the summed score of the outcome of the final game of the week in this cell to complete the week and designate a winner');
+    sheet.getRange(outcomeRow,tiebreakerCol).setNote('Enter the COMBINED score of the tiebreaker game (late Monday night game, or the last game of a playoff week) to complete the week and designate a winner');
+    sheet.getRange(outcomeRow,tiebreaker2Col).setNote(`Enter the WINNING team's score in that same tiebreaker game — only used when Tiebreaker 1 is also tied`);
   }
 
   let lastWidthsValue, lastHeaderFontValue, lastSubHeaderFontValue;
@@ -9569,6 +9847,15 @@ function getExistingWeeklySheetData(ss, week, forms) {
       Logger.log(`🚫 Tiebreaker range not found. Skipping preservation.`);
     }
 
+    let tiebreakers2 = [];
+    const tiebreaker2Range = ss.getRangeByName(`${LEAGUE}_TIEBREAKER2_${week}`);
+    if (tiebreaker2Range) {
+      tiebreakers2 = tiebreaker2Range.getValues();
+      Logger.log(`⚖️ Tiebreaker 2 range found; preserving second tiebreakers.`);
+    } else {
+      Logger.log(`🚫 Tiebreaker 2 range not found. Skipping preservation.`);
+    }
+
     let comments = [];
     const commentsRange = ss.getRangeByName(`COMMENTS_${week}`);
     if (commentsRange) {
@@ -9591,6 +9878,7 @@ function getExistingWeeklySheetData(ss, week, forms) {
         data.playerData[name] = {
           picks: picks[index] || [],
           tiebreaker: tiebreakers[index] ? tiebreakers[index][0] : '',
+          tiebreaker2: tiebreakers2[index] ? tiebreakers2[index][0] : '',
           comment: comments[index] ? comments[index][0] : ''
         };
       }
@@ -9602,11 +9890,13 @@ function getExistingWeeklySheetData(ss, week, forms) {
     const marginsRange = ss.getRangeByName(`${LEAGUE}_PICKEM_OUTCOMES_${week}_MARGIN`);
     const spreadsRange = ss.getRangeByName(`${LEAGUE}_SPREADS_${week}`);
     const tiebreakerOutcomeRange = ss.getRangeByName(`${LEAGUE}_TIEBREAKER_${week}_OUTCOME`);
+    const tiebreaker2OutcomeRange = ss.getRangeByName(`${LEAGUE}_TIEBREAKER2_${week}_OUTCOME`);
 
     data.outcomes = outcomesRange ? outcomesRange.getValues()[0] : [];
     data.margins = marginsRange ? marginsRange.getValues()[0] : [];
     data.spreads = spreadsRange ? spreadsRange.getValues()[0] : [];
     data.tiebreaker = tiebreakerOutcomeRange ? tiebreakerOutcomeRange.getValue() : '';
+    data.tiebreaker2 = tiebreaker2OutcomeRange ? tiebreaker2OutcomeRange.getValue() : '';
 
     Logger.log(`↩️ Returning collected data to the weekly sheet builder.`);
     return Object.keys(data.playerData).length > 0 ? data : null;
@@ -9627,12 +9917,13 @@ function getExistingWeeklySheetData(ss, week, forms) {
  * @param {Array<string>} newMemberList The official new list of member names in the correct order.
  */
 function remapAndRepopulateData(ss, week, existingData, newMatchupMap, newMemberList) {
-  const { oldMatchupMap, playerData, outcomes, margins, spreads, tiebreaker } = existingData;
+  const { oldMatchupMap, playerData, outcomes, margins, spreads, tiebreaker, tiebreaker2 } = existingData;
   const unplacedMembers = [];
   
   // --- Part 1: Remap and Repopulate Player Data (Picks, Comments, etc.) ---
   const newPicks = new Array(newMemberList.length).fill(null).map(() => []);
   const newTiebreakers = new Array(newMemberList.length).fill(null).map(() => ['']);
+  const newTiebreakers2 = new Array(newMemberList.length).fill(null).map(() => ['']);
   const newComments = new Array(newMemberList.length).fill(null).map(() => ['']);
 
   // Create a map for quick lookups of new player positions
@@ -9649,6 +9940,7 @@ function remapAndRepopulateData(ss, week, existingData, newMatchupMap, newMember
       
       // Place tiebreaker and comment directly
       newTiebreakers[newIndex][0] = oldPlayer.tiebreaker;
+      newTiebreakers2[newIndex][0] = oldPlayer.tiebreaker2;
       newComments[newIndex][0] = oldPlayer.comment;
       
       // Now, remap the picks based on the new game order
@@ -9677,6 +9969,7 @@ function remapAndRepopulateData(ss, week, existingData, newMatchupMap, newMember
   // Write the reordered player data to the sheet in batch
   ss.getRangeByName(`${LEAGUE}_PICKS_${week}`)?.setValues(newPicks);
   ss.getRangeByName(`${LEAGUE}_TIEBREAKER_${week}`)?.setValues(newTiebreakers);
+  ss.getRangeByName(`${LEAGUE}_TIEBREAKER2_${week}`)?.setValues(newTiebreakers2);
   ss.getRangeByName(`COMMENTS_${week}`)?.setValues(newComments);
 
   // --- Part 2: Remap and Repopulate Admin Data (Outcomes, Spreads, etc.) ---
@@ -9704,6 +9997,7 @@ function remapAndRepopulateData(ss, week, existingData, newMatchupMap, newMember
   ss.getRangeByName(`${LEAGUE}_PICKEM_OUTCOMES_${week}_MARGIN`)?.setValues([newMargins]);
   ss.getRangeByName(`${LEAGUE}_SPREADS_${week}`)?.setValues([newSpreads]);
   ss.getRangeByName(`${LEAGUE}_TIEBREAKER_${week}_OUTCOME`)?.setValue(tiebreaker);
+  ss.getRangeByName(`${LEAGUE}_TIEBREAKER2_${week}_OUTCOME`)?.setValue(tiebreaker2);
 }
 
 
@@ -9987,8 +10281,2115 @@ function calculateWildcardScore(playerPicksRange) {
 
 
 // ============================================================================================================================================
+// WEEKLY OPERATIONS
+// ============================================================================================================================================
+
+/**
+ * Maps a sheet week number onto the ESPN scoreboard's week/season-type pair.
+ * Regular season weeks pass straight through; the playoffs restart their numbering.
+ */
+function scoreboardWeekParams(week) {
+  const w = Number(week);
+  if (w <= REGULAR_SEASON) return { week: w, seasontype: 2 };
+  const playoffRound = { 19: 1, 20: 2, 21: 3, 23: 5 }; // 4 is the Pro Bowl, which we never score
+  return { week: playoffRound[w] || 1, seasontype: 3 };
+}
+
+/**
+ * Pulls outcomes for one week straight from the API, with no sidebar.
+ *
+ * @param {number} week Week to score.
+ * @param {Spreadsheet} [ss] Optional spreadsheet handle.
+ * @returns {Object} {placed, completed, total} counts.
+ */
+function importOutcomesForWeek(week, ss) {
+  ss = fetchSpreadsheet(ss);
+  const formsData = fetchProperties('forms') || {};
+  if (!formsData[week] || !formsData[week].gamePlan) {
+    return { placed: false, completed: 0, total: 0, reason: `no form was ever built for week ${week}` };
+  }
+  const params = scoreboardWeekParams(week);
+  const payload = espnFetchJson(`${SCOREBOARD}?week=${params.week}&seasontype=${params.seasontype}`);
+  const events = (payload && payload.events) || [];
+  const analysis = parseApiEvents(events, formsData[week].gamePlan);
+  const total = formsData[week].gamePlan.games.length;
+  if (!analysis.complete.length) {
+    return { placed: false, completed: 0, total: total, reason: `no games have finished yet` };
+  }
+  updateSheetsWithApiOutcomes(ss, week, analysis.complete, formsData, true);
+  return { placed: true, completed: analysis.complete.length, total: total };
+}
+
+/**
+ * The whole end-of-week routine in one action: pull outcomes, refresh formulas, then
+ * recompute every payout tab. Refuses to pay out a week that is not fully scored.
+ */
+function closeOutWeek() {
+  const ss = fetchSpreadsheet();
+  const ui = fetchUi();
+  const formsData = fetchProperties('forms') || {};
+  const built = Object.keys(formsData).map(Number).filter(w => !isNaN(w)).sort((a, b) => a - b);
+  if (!built.length) {
+    ui.alert(`⛔ NO WEEKS YET`, `No weekly forms have been built, so there is nothing to close out.`, ui.ButtonSet.OK);
+    return;
+  }
+
+  const suggested = built[built.length - 1];
+  const prompt = ui.prompt(`✅ CLOSE OUT WEEK`,
+    `Which week should I close out?\n\nThis pulls the final scores, refreshes the formulas, and recomputes every payout tab.\n\nWeeks with forms: ${built.join(', ')}\n\nEnter a week number (or leave blank for ${suggested}):`,
+    ui.ButtonSet.OK_CANCEL);
+  if (prompt.getSelectedButton() !== ui.Button.OK) return;
+  const entered = prompt.getResponseText().trim();
+  const week = entered ? parseInt(entered, 10) : suggested;
+  if (isNaN(week) || built.indexOf(week) === -1) {
+    ui.alert(`⚠️ UNKNOWN WEEK`, `Week ${entered} has no form. Weeks with forms: ${built.join(', ')}`, ui.ButtonSet.OK);
+    return;
+  }
+
+  const notes = [];
+  try {
+    ss.toast(`Fetching final scores for week ${week}...`, `1/3 OUTCOMES`);
+    const outcome = importOutcomesForWeek(week, ss);
+    notes.push(outcome.placed
+      ? `✅ Outcomes: ${outcome.completed} of ${outcome.total} games final`
+      : `⏩ Outcomes: ${outcome.reason}`);
+
+    ss.toast(`Refreshing formulas...`, `2/3 FORMULAS`);
+    allFormulasUpdate(ss);
+    notes.push(`✅ Formulas refreshed`);
+
+    ss.toast(`Recomputing payouts...`, `3/3 PAYOUTS`);
+    const data = computePayouts(ss);
+    writeWeeklyPlaces(ss, data);
+    wklyPayoutSheet(ss, data);
+    wklyConsensusPayoutSheet(ss, data);
+    seasonPointsSheet(ss, data);
+    seasonTotalsSheet(ss, data);
+    if (data.playoffWeeksScored) playoffPointsSheet(ss, data);
+    summaryPayoutSheet(ss, data);
+    standingsSheet(ss, data);
+    wklyRankSheet(ss, data);
+    seasonRankSheet(ss, data);
+    rankJumpChartSheet(ss, data);
+
+    // Only a fully scored week pays out, so say plainly whether this one did
+    if (data.weeklyMoney[week]) {
+      const winners = Object.keys(data.weeklyPlaces[week]).filter(n => data.weeklyPlaces[week][n] === 1);
+      const paid = Object.keys(data.weeklyMoney[week]).filter(n => data.weeklyMoney[week][n] > 0).length;
+      notes.push(`✅ Week ${week} paid out: ${winners.join(', ')} took first, ${paid} members in the money`);
+      const consensus = data.consensusMoney[week];
+      if (consensus) {
+        notes.push(consensus.refunded
+          ? `↩️ Consensus: nobody beat the crowd, pot refunded evenly`
+          : `✅ Consensus: ${consensus.winners} beat the crowd`);
+      }
+    } else {
+      notes.push(`⏸️ Week ${week} is not fully scored yet, so no money was paid. Enter any missing outcomes on the WK${week} sheet and run this again.`);
+    }
+
+    ui.alert(`✅ WEEK ${week} CLOSE-OUT`, notes.join(`\n\n`), ui.ButtonSet.OK);
+  } catch (err) {
+    Logger.log(`❌ closeOutWeek failed: ${err.stack}`);
+    ui.alert(`⚠️ CLOSE-OUT FAILED`, `${notes.join('\n')}\n\nThen it stopped:\n${err.message}`, ui.ButtonSet.OK);
+  }
+}
+
+/**
+ * Checks the things that quietly drift over a long season and reports anything wrong.
+ */
+function healthCheck() {
+  const ss = fetchSpreadsheet();
+  const ui = fetchUi();
+  const config = fetchProperties('configuration') || {};
+  const memberData = fetchProperties('members') || { memberOrder: [], members: {} };
+  const formsData = fetchProperties('forms') || {};
+  const problems = [], notes = [];
+
+  // --- roster
+  const roster = memberData.memberOrder.map(id => memberData.members[id] && memberData.members[id].name).filter(Boolean);
+  notes.push(`👥 ${roster.length} members on the roster`);
+  const dupes = roster.filter((n, i) => roster.map(x => x.toLowerCase()).indexOf(n.toLowerCase()) !== i);
+  if (dupes.length) problems.push(`Duplicate member names: ${dupes.join(', ')}`);
+  const noEmail = memberData.memberOrder.filter(id => !(memberData.members[id] || {}).email).length;
+  if (noEmail) notes.push(`📧 ${noEmail} member(s) have no email on file`);
+
+  // --- configuration matches the pool rules
+  if (config.pickemsAts) problems.push(`Against-the-spread is ON but this pool picks straight up`);
+  if (!config.bonusInclude) problems.push(`Bonus is OFF, so the weekly bonus game cannot be set`);
+  if (!config.tiebreakerInclude) problems.push(`Tiebreakers are OFF but the weekly pool needs them to order places`);
+  if (config.survivorInclude || config.eliminatorInclude) problems.push(`Survivor/Eliminator is ON but this pool does not run them`);
+  if (!config.kickoffLock) notes.push(`🔓 Kickoff lock is off, so late picks are still accepted`);
+
+  // --- per-week named ranges
+  const weeks = Object.keys(formsData).map(Number).filter(w => !isNaN(w)).sort((a, b) => a - b);
+  const required = ['NAMES_%', `${LEAGUE}_PICKS_%`, `${LEAGUE}_PICKEM_OUTCOMES_%`, `${LEAGUE}_BONUS_%`,
+                    `${LEAGUE}_TIEBREAKER_%`, `${LEAGUE}_TIEBREAKER2_%`, `${LEAGUE}_CONSENSUS_%`, 'WIN_%'];
+  weeks.forEach(week => {
+    if (!ss.getSheetByName(`${weeklySheetPrefix}${week}`)) return; // sheet not built yet is fine
+    const missing = required.filter(r => !ss.getRangeByName(r.replace('%', week)));
+    if (missing.length) problems.push(`WK${week} is missing named ranges: ${missing.map(m => m.replace('%', week)).join(', ')}`);
+  });
+
+  // --- money reconciles
+  try {
+    const data = computePayouts(ss);
+    const scored = data.weeksScored.length;
+    notes.push(`📅 ${scored} week(s) fully scored`);
+    notes.push(`💵 Weekly pot $${data.weeklyPot.toFixed(2)}, consensus pot $${data.consensusPot.toFixed(2)}, ${data.ladder.length} places at ${data.ladder.join('/')}%`);
+    const paidWeekly = Object.keys(data.totals.weeklyWins).reduce((s, n) => s + data.totals.weeklyWins[n], 0);
+    const owedWeekly = data.weeklyPot * scored;
+    if (Math.abs(paidWeekly - owedWeekly) > 0.005) {
+      problems.push(`Weekly Wins paid $${paidWeekly.toFixed(2)} but collected $${owedWeekly.toFixed(2)} across ${scored} scored week(s)`);
+    }
+    const paidConsensus = Object.keys(data.totals.weeklyConsensus).reduce((s, n) => s + data.totals.weeklyConsensus[n], 0);
+    const owedConsensus = data.consensusPot * Object.keys(data.consensusMoney).length;
+    if (Math.abs(paidConsensus - owedConsensus) > 0.005) {
+      problems.push(`Weekly Consensus paid $${paidConsensus.toFixed(2)} but collected $${owedConsensus.toFixed(2)}`);
+    }
+    // every member should appear on every payout tab
+    ['Wkly Payout', 'Wkly Consensus', 'Season Points', 'Summary Payout'].forEach(tab => {
+      const sheet = ss.getSheetByName(tab);
+      if (!sheet) { notes.push(`📄 ${tab} not built yet`); return; }
+      const listed = sheet.getRange(2, 1, Math.max(sheet.getLastRow() - 1, 1), 1).getValues().flat()
+        .map(v => v ? v.toString() : '');
+      const absent = roster.filter(n => listed.indexOf(n) === -1);
+      if (absent.length) problems.push(`${tab} is missing: ${absent.join(', ')} -- re-run Update Payouts`);
+    });
+  } catch (err) {
+    problems.push(`Could not reconcile payouts: ${err.message}`);
+  }
+
+  const verdict = problems.length
+    ? `⚠️ ${problems.length} PROBLEM${problems.length === 1 ? '' : 'S'} FOUND`
+    : `✅ ALL CHECKS PASSED`;
+  ui.alert(verdict, (problems.length ? problems.map(p => `❌ ${p}`).join(`\n`) + `\n\n---\n\n` : ``) + notes.join(`\n`), ui.ButtonSet.OK);
+  Logger.log(`🩺 Health check: ${problems.length} problem(s). ${problems.join(' | ')}`);
+}
+
+/**
+ * Duplicates the whole spreadsheet into the pool's Drive folder, timestamped.
+ * Worth running before anything that rebuilds sheets.
+ */
+function snapshotSpreadsheet(silent) {
+  const ss = fetchSpreadsheet();
+  const config = fetchProperties('configuration') || {};
+  try {
+    const stamp = Utilities.formatDate(new Date(), Session.getScriptTimeZone() || 'GMT', 'yyyy-MM-dd HH-mm');
+    const name = `${ss.getName()} -- BACKUP ${stamp}`;
+    const copy = DriveApp.getFileById(ss.getId()).makeCopy(name);
+    try {
+      copy.moveTo(getFormsFolder(config.groupName || `${LEAGUE} Picks Pool`));
+    } catch (err) {
+      Logger.log(`⚠️ Snapshot created but could not be filed in the pool folder: ${err.message}`);
+    }
+    Logger.log(`📸 Snapshot created: ${name}`);
+    if (!silent) {
+      showLinkDialog(copy.getUrl(), `📸 Snapshot Created`, name,
+        `\nA full copy of this spreadsheet has been saved to your pool folder. Nothing in this file changed.`);
+    }
+    return copy;
+  } catch (err) {
+    Logger.log(`❌ Snapshot failed: ${err.stack}`);
+    if (!silent) fetchUi().alert(`⚠️ SNAPSHOT FAILED`, `Could not copy the spreadsheet:\n\n${err.message}`, SpreadsheetApp.getUi().ButtonSet.OK);
+    return null;
+  }
+}
+
+/**
+ * Turns the kickoff lock on or off. When on, each new form gets a one-time trigger that
+ * closes it at the week's first kickoff so nobody submits picks after games start.
+ */
+function toggleKickoffLock() {
+  const ui = fetchUi();
+  const config = fetchProperties('configuration') || {};
+  const turningOn = !config.kickoffLock;
+  const answer = ui.alert(turningOn ? `🔒 ENABLE KICKOFF LOCK` : `🔓 DISABLE KICKOFF LOCK`,
+    turningOn
+      ? `Each new weekly form will close automatically at that week's first kickoff, so late picks are refused.\n\nForms already created are unaffected.\n\nEnable it?`
+      : `New forms will stay open after kickoff, accepting late picks.\n\nDisable the lock?`,
+    ui.ButtonSet.YES_NO);
+  if (answer !== ui.Button.YES) return;
+  config.kickoffLock = turningOn;
+  saveProperties('configuration', config);
+  fetchSpreadsheet().toast(turningOn ? `Kickoff lock enabled` : `Kickoff lock disabled`, turningOn ? `🔒 LOCKED` : `🔓 UNLOCKED`);
+  Logger.log(`${turningOn ? '🔒' : '🔓'} kickoffLock set to ${turningOn}`);
+}
+
+/**
+ * Earliest kickoff in a week, built from the game date plus its hour and minute.
+ *
+ * Ben's form-lock trigger uses new Date(game.date), which is midnight on the game's day
+ * rather than the actual kickoff. Reminders need the real time, so hour/minute are applied here.
+ *
+ * @param {Object} gamePlan The week's saved game plan.
+ * @returns {Date|null} The first kickoff, or null if it cannot be determined.
+ */
+function weekFirstKickoff(gamePlan) {
+  if (!gamePlan || !gamePlan.games || !gamePlan.games.length) return null;
+  let earliest = null;
+  gamePlan.games.forEach(game => {
+    const base = new Date(game.date);
+    if (isNaN(base.getTime())) return;
+    const when = new Date(base.getFullYear(), base.getMonth(), base.getDate(),
+      Number(game.hour) || 0, Number(game.minute) || 0);
+    if (!earliest || when < earliest) earliest = when;
+  });
+  return earliest;
+}
+
+/**
+ * Works out who still owes picks for a week.
+ *
+ * The stored respondent list is refreshed from the form first -- otherwise anyone who
+ * submitted since the last import would be nagged for picks they have already made.
+ *
+ * @param {number} week Week to check.
+ * @returns {Object} {form, targets, missingEmail, pendingCount} or {error}
+ */
+function reminderRecipients(week) {
+  try {
+    syncFormResponses(week);        // make sure the outstanding list is current
+  } catch (err) {
+    Logger.log(`⚠️ Could not refresh responses for week ${week} before reminding: ${err.message}`);
+  }
+
+  const formsData = fetchProperties('forms') || {};
+  const memberData = fetchProperties('members') || { memberOrder: [], members: {} };
+  const form = formsData[week];
+  if (!form) return { error: `There is no form recorded for week ${week}.` };
+
+  const pending = form.nonRespondents || [];
+  const targets = [], missingEmail = [];
+  pending.forEach(id => {
+    const m = memberData.members[id];
+    if (!m) return;
+    if (m.email) targets.push({ name: m.name, email: m.email });
+    else missingEmail.push(m.name);
+  });
+  return { form: form, targets: targets, missingEmail: missingEmail, pendingCount: pending.length };
+}
+
+/**
+ * Sends the reminder emails and records that the week has been reminded.
+ *
+ * @param {number} week Week being reminded about.
+ * @param {Object} info Result of reminderRecipients().
+ * @returns {Object} {sent, failures}
+ */
+function sendReminderEmails(week, info) {
+  const config = fetchProperties('configuration') || {};
+  const url = info.form.publishedUrl || '';
+  const subject = `${config.groupName || `${LEAGUE} Picks`} -- Week ${week} picks needed`;
+
+  let sent = 0;
+  const failures = [];
+  info.targets.forEach(t => {
+    try {
+      MailApp.sendEmail(t.email, subject,
+        `${t.name},\n\nYour week ${week} picks are not in yet.\n\n${url}\n\nGood luck.\n`);
+      sent++;
+    } catch (err) {
+      failures.push(`${t.name} (${err.message})`);
+    }
+  });
+
+  // Recorded so a re-fired trigger cannot email the same week twice
+  const formsData = fetchProperties('forms') || {};
+  if (formsData[week]) {
+    formsData[week].reminderSentAt = new Date().toISOString();
+    formsData[week].reminderSentCount = sent;
+    saveProperties('forms', formsData);
+  }
+
+  Logger.log(`📧 Week ${week}: sent ${sent} reminder(s). Failures: ${failures.join('; ') || 'none'}`);
+  return { sent: sent, failures: failures };
+}
+
+/**
+ * Menu action: remind whoever has not submitted, after showing you the list.
+ */
+function remindNonRespondents() {
+  const ss = fetchSpreadsheet();
+  const ui = fetchUi();
+  const formsData = fetchProperties('forms') || {};
+
+  const openWeeks = Object.keys(formsData).map(Number)
+    .filter(w => !isNaN(w) && formsData[w].active !== false).sort((a, b) => b - a);
+  const week = openWeeks.length ? openWeeks[0] : null;
+  if (!week) {
+    ui.alert(`⛔ NO OPEN FORM`, `There is no active weekly form to remind anyone about.`, ui.ButtonSet.OK);
+    return;
+  }
+
+  ss.toast(`Checking who still owes picks for week ${week}...`, `📧 CHECKING`);
+  const info = reminderRecipients(week);
+  if (info.error) {
+    ui.alert(`⚠️ CANNOT REMIND`, info.error, ui.ButtonSet.OK);
+    return;
+  }
+  if (!info.pendingCount) {
+    ui.alert(`✅ EVERYONE IS IN`, `All members have submitted picks for week ${week}.`, ui.ButtonSet.OK);
+    return;
+  }
+  if (!info.targets.length) {
+    ui.alert(`⚠️ NO EMAIL ADDRESSES`, `${info.pendingCount} member(s) have not submitted, but none of them have an email on file:\n\n${info.missingEmail.join(', ')}\n\nAdd addresses via the sign-up form or the Member Manager.`, ui.ButtonSet.OK);
+    return;
+  }
+
+  const preview = info.targets.slice(0, 20).map(t => `  • ${t.name} <${t.email}>`).join(`\n`)
+    + (info.targets.length > 20 ? `\n  ...and ${info.targets.length - 20} more` : ``);
+  const already = info.form.reminderSentAt
+    ? `\nNote: a reminder for this week already went out on ${new Date(info.form.reminderSentAt).toLocaleString()}.\n` : ``;
+
+  const answer = ui.alert(`📧 SEND ${info.targets.length} REMINDER${info.targets.length === 1 ? '' : 'S'}?`,
+    `Week ${week} picks are still missing from:\n\n${preview}\n\n` +
+    (info.missingEmail.length ? `No email on file for: ${info.missingEmail.join(', ')}\n\n` : ``) +
+    already +
+    `Each will get the form link. Mail is sent from your own Google account.\n\nSend now?`,
+    ui.ButtonSet.YES_NO);
+  if (answer !== ui.Button.YES) {
+    ss.toast(`No reminders sent`, `⛔ CANCELED`);
+    return;
+  }
+
+  const result = sendReminderEmails(week, info);
+  ui.alert(`📧 ${result.sent} REMINDER${result.sent === 1 ? '' : 'S'} SENT`,
+    `Week ${week} reminders sent to ${result.sent} member(s).` +
+    (result.failures.length ? `\n\nFailed: ${result.failures.join(', ')}` : ``) +
+    (info.missingEmail.length ? `\n\nSkipped, no email on file: ${info.missingEmail.join(', ')}` : ``),
+    ui.ButtonSet.OK);
+}
+
+/**
+ * Schedules the automatic reminder for a week: REMINDER_HOURS_BEFORE_KICKOFF hours before
+ * that week's first kickoff. Called when a form is built, and safe to call again -- any
+ * previously scheduled reminder for the same week is replaced.
+ *
+ * @param {number} week The week the form covers.
+ * @param {Object} gamePlan That week's game plan.
+ */
+function scheduleWeeklyReminder(week, gamePlan) {
+  const config = fetchProperties('configuration') || {};
+  if (config.autoRemind === false) {
+    Logger.log(`🔕 Auto-reminders are switched off; nothing scheduled for week ${week}.`);
+    return;
+  }
+
+  const kickoff = weekFirstKickoff(gamePlan);
+  if (!kickoff) {
+    Logger.log(`⚠️ Could not determine the first kickoff for week ${week}; no reminder scheduled.`);
+    return;
+  }
+  const sendAt = new Date(kickoff.getTime() - (REMINDER_HOURS_BEFORE_KICKOFF * 60 * 60 * 1000));
+  if (sendAt <= new Date()) {
+    Logger.log(`⏩ Week ${week} reminder time (${sendAt.toLocaleString()}) has already passed; nothing scheduled.`);
+    return;
+  }
+
+  const formsData = fetchProperties('forms') || {};
+  // Replace rather than stack, so rebuilding a form does not double-email
+  if (formsData[week] && formsData[week].reminderTriggerId) {
+    deleteTriggerById(formsData[week].reminderTriggerId);
+  }
+
+  const trigger = ScriptApp.newTrigger('executeWeeklyReminder').timeBased().at(sendAt).create();
+  const triggerId = trigger.getUniqueId();
+  PropertiesService.getDocumentProperties()
+    .setProperty('triggerMeta_' + triggerId, JSON.stringify({ week: week, kind: 'reminder' }));
+
+  if (formsData[week]) {
+    formsData[week].reminderTriggerId = triggerId;
+    formsData[week].reminderScheduledFor = sendAt.toISOString();
+    delete formsData[week].reminderSentAt;      // a fresh form gets a fresh reminder
+    saveProperties('forms', formsData);
+  }
+
+  Logger.log(`📧 Week ${week} reminder scheduled for ${sendAt.toLocaleString()} (${REMINDER_HOURS_BEFORE_KICKOFF}h before ${kickoff.toLocaleString()}).`);
+  SpreadsheetApp.getActiveSpreadsheet().toast(
+    `Non-respondents will be emailed ${REMINDER_HOURS_BEFORE_KICKOFF} hours before kickoff`, `📧 AUTO-REMINDER SET`);
+}
+
+/**
+ * Trigger handler for the automatic reminder. Sends nothing if the form has closed, if
+ * everyone is in, or if this week has already been reminded.
+ */
+function executeWeeklyReminder(e) {
+  const triggerId = e && e.triggerUid;
+  const docProps = PropertiesService.getDocumentProperties();
+  const meta = triggerId ? docProps.getProperty('triggerMeta_' + triggerId) : null;
+  if (!meta) {
+    Logger.log(`⭕ executeWeeklyReminder fired without usable metadata; cleaning up.`);
+    if (triggerId) deleteTriggerById(triggerId);
+    return;
+  }
+
+  const week = JSON.parse(meta).week;
+  try {
+    const formsData = fetchProperties('forms') || {};
+    const form = formsData[week];
+    if (!form) { Logger.log(`⭕ Week ${week} has no form; no reminder sent.`); return; }
+    if (form.active === false) { Logger.log(`⏩ Week ${week} form is closed; no reminder sent.`); return; }
+    if (form.reminderSentAt) { Logger.log(`⏩ Week ${week} was already reminded at ${form.reminderSentAt}; not sending again.`); return; }
+
+    const info = reminderRecipients(week);
+    if (info.error) { Logger.log(`⚠️ ${info.error}`); return; }
+    if (!info.targets.length) {
+      Logger.log(`✅ Week ${week}: nobody to remind (${info.pendingCount} outstanding, ${info.missingEmail.length} without an email).`);
+      return;
+    }
+    const result = sendReminderEmails(week, info);
+    Logger.log(`📧 Automatic week ${week} reminder: ${result.sent} sent, ${info.missingEmail.length} skipped for no email.`);
+  } catch (err) {
+    Logger.log(`❌ Automatic week ${week} reminder failed: ${err.stack}`);
+  } finally {
+    deleteTriggerById(triggerId);
+    docProps.deleteProperty('triggerMeta_' + triggerId);
+  }
+}
+
+/**
+ * Turns automatic reminders on or off for future forms.
+ */
+function toggleAutoRemind() {
+  const ui = fetchUi();
+  const config = fetchProperties('configuration') || {};
+  // Undefined means on, so that a pool set up before this feature existed still gets reminders
+  const currentlyOn = config.autoRemind !== false;
+  const turningOn = !currentlyOn;
+  const answer = ui.alert(turningOn ? `📧 ENABLE AUTO-REMINDERS` : `🔕 DISABLE AUTO-REMINDERS`,
+    turningOn
+      ? `Each new weekly form will email anyone who has not submitted, ${REMINDER_HOURS_BEFORE_KICKOFF} hours before that week's first kickoff.\n\nThe respondent list is refreshed first, so nobody who has already picked gets a reminder.\n\nEnable it?`
+      : `New forms will not send automatic reminders. You can still send them by hand from the menu.\n\nAlready-scheduled reminders for existing forms will still fire.\n\nDisable?`,
+    ui.ButtonSet.YES_NO);
+  if (answer !== ui.Button.YES) return;
+  config.autoRemind = turningOn;
+  saveProperties('configuration', config);
+  fetchSpreadsheet().toast(turningOn ? `Automatic reminders enabled` : `Automatic reminders disabled`,
+    turningOn ? `📧 AUTO-REMIND ON` : `🔕 AUTO-REMIND OFF`);
+  Logger.log(`${turningOn ? '📧' : '🔕'} autoRemind set to ${turningOn}`);
+}
+
+// ============================================================================================================================================
+// PAYOUTS
+// ============================================================================================================================================
+//
+// One engine drives every pool's money so the tie rule lives in exactly one place.
+//
+// Two DIFFERENT tie rules are in play, and they must not be confused:
+//   * MONEY (this section): ties consume the places below them and split the combined
+//     percentage. A 3-way tie for 1st takes the percentages for places 1, 2 and 3, adds
+//     them together and splits the total three ways -- the next finisher is then 4th.
+//   * SEASON POINTS (weeklyPlacementPoints): tied players all receive that tier's full
+//     points, and the next DISTINCT score receives the next tier down. Nothing is consumed.
+
+/**
+ * How many places get paid, given the size of the pool.
+ *
+ * @param {number} entries Number of paid entries.
+ * @returns {Array<number>} Percentage of the pot for each place, best first.
+ */
+function payoutLadder(entries) {
+  const count = Number(entries) || 0;
+  const rule = PAYOUT_PLACE_BREAKPOINTS.find(b => count >= b.minEntries) || { places: 3 };
+  return PAYOUT_LADDERS[rule.places] || PAYOUT_LADDERS[3];
+}
+
+/**
+ * Standard competition ranking: ties share the better rank and the next distinct value skips
+ * ahead (1, 2, 2, 4). Higher values rank better.
+ *
+ * @param {Object} valuesByName Map of name to the value being ranked.
+ * @returns {Object} Map of name to rank.
+ */
+function competitionRanks(valuesByName) {
+  const names = Object.keys(valuesByName || {});
+  const sorted = names.slice().sort((a, b) => valuesByName[b] - valuesByName[a]);
+  const ranks = {};
+  let rank = 0, seen = null, shown = 0;
+  sorted.forEach(n => {
+    shown++;
+    if (valuesByName[n] !== seen) { rank = shown; seen = valuesByName[n]; }
+    ranks[n] = rank;
+  });
+  return ranks;
+}
+
+/**
+ * Rounds a list of {name, amount} payouts to whole cents without losing or inventing money.
+ * Any residual from rounding is pushed onto the largest payout, so each pool's dollars paid
+ * always equals the dollars collected.
+ *
+ * @param {Array<Object>} payouts Objects carrying an "amount" property.
+ * @param {number} pot The exact pot being distributed.
+ * @returns {Array<Object>} The same objects with amounts rounded to cents.
+ */
+function roundPayoutsToCents(payouts, pot) {
+  const list = payouts || [];
+  if (!list.length) return list;
+  let running = 0;
+  list.forEach(p => { p.amount = Math.round((Number(p.amount) || 0) * 100) / 100; running += p.amount; });
+  const residual = Math.round((pot - running) * 100) / 100;
+  if (residual !== 0) {
+    let biggest = 0;
+    list.forEach((p, i) => { if (p.amount > list[biggest].amount) biggest = i; });
+    list[biggest].amount = Math.round((list[biggest].amount + residual) * 100) / 100;
+  }
+  return list;
+}
+
+/**
+ * Splits a pot across ranked groups of tied players.
+ *
+ * @param {number} pot Total money for the pool.
+ * @param {Array<number>} groupSizes Player counts per finishing group, best group first.
+ * @param {Array<number>} ladder Percentage per place.
+ * @returns {Array<number>} Per-person amount for each group, aligned to groupSizes.
+ */
+function distributeTieredPot(pot, groupSizes, ladder) {
+  const amounts = [];
+  let place = 0;
+  (groupSizes || []).forEach(size => {
+    const members = Number(size) || 0;
+    let percent = 0;
+    for (let i = 0; i < members; i++) {
+      if (place + i < ladder.length) percent += ladder[place + i];
+    }
+    amounts.push(members > 0 ? (pot * percent / 100) / members : 0);
+    place += members;
+  });
+  return amounts;
+}
+
+/**
+ * Splits a pot evenly among winners, or evenly among all entrants when nobody won.
+ * Used by both consensus pools, where beating the crowd is pass/fail rather than ranked.
+ *
+ * @param {number} pot Total money for the pool.
+ * @param {number} winners How many members beat the consensus.
+ * @param {number} entrants How many members entered.
+ * @returns {Object} {each, refunded} -- refunded is true when the pot was returned to everyone.
+ */
+function distributeOrRefund(pot, winners, entrants) {
+  if (winners > 0) return { each: pot / winners, refunded: false };
+  if (entrants > 0) return { each: pot / entrants, refunded: true };
+  return { each: 0, refunded: false };
+}
+
+/**
+ * Season-points tiers for one week. Ties share a tier and the next DISTINCT correct
+ * count takes the next tier down, so a five-way tie for first leaves everyone on 5
+ * and the following group on 4.
+ *
+ * @param {Object} correctByName Map of member name to correct count for the week.
+ * @returns {Object} Map of member name to points earned.
+ */
+function weeklyPlacementPoints(correctByName) {
+  const tiers = [5, 4, 3, 2, 1];
+  const scores = Object.keys(correctByName)
+    .map(name => Number(correctByName[name]))
+    .filter(v => !isNaN(v));
+  const distinct = Array.from(new Set(scores)).sort((a, b) => b - a);
+
+  const points = {};
+  Object.keys(correctByName).forEach(name => {
+    const value = Number(correctByName[name]);
+    if (isNaN(value)) { points[name] = 0; return; }
+    const tierIndex = distinct.indexOf(value);
+    points[name] = (tierIndex > -1 && tierIndex < tiers.length) ? tiers[tierIndex] : 0;
+  });
+  return points;
+}
+
+/**
+ * Reads one week's results and ranks members for the weekly money.
+ *
+ * Scores are computed here from the raw picks, outcomes and bonus row rather than read from
+ * the sheet's Picks column, so the two things that make this pool different are explicit:
+ *   * the weekly BONUS game is worth its multiplier, and weekly placement ranks on points;
+ *   * a game the NFL ties is a freebie worth a point to everybody.
+ * Raw correct picks are tracked separately because the consensus pools and Season % Correct
+ * ignore the bonus entirely.
+ *
+ * Ranking is points first, then the two tiebreakers. Members identical on all three share a
+ * place. Weeks that are not fully scored return null so money is never paid on a part-played week.
+ *
+ * @param {number} week Week number.
+ * @param {Spreadsheet} [ss] Optional spreadsheet handle.
+ * @returns {Object|null} {groups, matchups, tieGames, perfect}
+ */
+function weeklyResults(week, ss) {
+  ss = fetchSpreadsheet(ss);
+
+  const namesRange = ss.getRangeByName(`NAMES_${week}`);
+  const picksRange = ss.getRangeByName(`${LEAGUE}_PICKS_${week}`);
+  const outcomeRange = ss.getRangeByName(`${LEAGUE}_PICKEM_OUTCOMES_${week}`);
+  if (!namesRange || !picksRange || !outcomeRange) return null;
+
+  const outcomes = outcomeRange.getValues()[0].map(v => (v === null || v === undefined) ? '' : v.toString().trim());
+  const matchups = outcomes.length;
+  const settled = outcomes.filter(v => v !== '').length;
+  if (!matchups || settled < matchups) return null; // week not finished -- pay nothing
+
+  // Bonus multipliers along the bottom of the weekly sheet; absent means every game counts once
+  const bonusRange = ss.getRangeByName(`${LEAGUE}_BONUS_${week}`);
+  const bonuses = bonusRange
+    ? bonusRange.getValues()[0].map(v => { const n = Number(v); return (!n || n < 1) ? 1 : n; })
+    : outcomes.map(() => 1);
+
+  const tieGames = outcomes.filter(v => v.toUpperCase() === 'TIE').length;
+  const tiePoints = outcomes.reduce((sum, o, i) => sum + (o.toUpperCase() === 'TIE' ? bonuses[i] : 0), 0);
+
+  const names = namesRange.getValues().flat();
+  const picks = picksRange.getValues();
+
+  // Tiebreaker differences, recomputed from the submitted guesses and the actual scores
+  const tb1 = ss.getRangeByName(`${LEAGUE}_TIEBREAKER_${week}`);
+  const tb2 = ss.getRangeByName(`${LEAGUE}_TIEBREAKER2_${week}`);
+  const tb1Outcome = ss.getRangeByName(`${LEAGUE}_TIEBREAKER_${week}_OUTCOME`);
+  const tb2Outcome = ss.getRangeByName(`${LEAGUE}_TIEBREAKER2_${week}_OUTCOME`);
+  const tb1Values = tb1 ? tb1.getValues().flat() : [];
+  const tb2Values = tb2 ? tb2.getValues().flat() : [];
+  const actual1 = tb1Outcome ? Number(tb1Outcome.getValue()) : NaN;
+  const actual2 = tb2Outcome ? Number(tb2Outcome.getValue()) : NaN;
+  const diff = (guess, actual) => {
+    const g = Number(guess);
+    if (guess === '' || guess === null || guess === undefined || isNaN(g) || isNaN(actual)) return Infinity;
+    return Math.abs(g - actual);
+  };
+
+  const players = [], perfect = [];
+  names.forEach((name, i) => {
+    if (!name) return;
+    const row = picks[i] || [];
+    const submitted = row.some(p => p !== '' && p !== null && p !== undefined);
+    if (!submitted) return;                       // no entry that week
+
+    let points = tiePoints, correct = tieGames;    // NFL ties are a freebie for everyone
+    outcomes.forEach((outcome, g) => {
+      if (!outcome || outcome.toUpperCase() === 'TIE') return;
+      const pick = (row[g] === null || row[g] === undefined) ? '' : row[g].toString().trim();
+      if (pick && pick === outcome) { points += bonuses[g]; correct += 1; }
+    });
+
+    players.push({
+      name: name.toString(),
+      points: points,
+      correct: correct,
+      diff1: diff(tb1Values[i], actual1),
+      diff2: diff(tb2Values[i], actual2)
+    });
+    if (correct === matchups) perfect.push(name.toString());
+  });
+
+  // Weekly money and season points both rank on bonus-inclusive points
+  players.sort((a, b) => (b.points - a.points) || (a.diff1 - b.diff1) || (a.diff2 - b.diff2));
+
+  const groups = [];
+  players.forEach(p => {
+    const last = groups[groups.length - 1];
+    if (last && last.points === p.points && last.diff1 === p.diff1 && last.diff2 === p.diff2) {
+      last.names.push(p.name);
+    } else {
+      groups.push({ names: [p.name], points: p.points, correct: p.correct, diff1: p.diff1, diff2: p.diff2 });
+    }
+  });
+
+  return { groups: groups, matchups: matchups, tieGames: tieGames, perfect: perfect };
+}
+
+/**
+ * Games that count for a week, or 0 when the week is not fully scored yet.
+ * Everyone shares the same denominator for a given week.
+ *
+ * @param {number} week Week number.
+ * @param {Spreadsheet} [ss] Optional spreadsheet handle.
+ * @returns {number} Game count, or 0 if the week is incomplete or missing.
+ */
+function getGamesPerWeek(week, ss) {
+  ss = fetchSpreadsheet(ss);
+  const outcomeRange = ss.getRangeByName(`${LEAGUE}_PICKEM_OUTCOMES_${week}`);
+  if (!outcomeRange) return 0;
+  const outcomes = outcomeRange.getValues()[0].map(v => (v === null || v === undefined) ? '' : v.toString().trim());
+  const total = outcomes.length;
+  const settled = outcomes.filter(v => v !== '').length;
+  return (total > 0 && settled === total) ? total : 0;  // an unfinished week is not selectable
+}
+
+/**
+ * Picks the weeks that count for Pool 3.
+ *
+ * Sorted by percentage, then by game count, then by week number. Sorting on game count
+ * before slicing is what implements the commissioner's rule that a same-percentage week
+ * with MORE games wins the last slot -- the higher-denominator week is simply already
+ * above the cut, so no separate bubble swap is needed.
+ *
+ * @param {Array<Object>} weekRecords [{week, correct, games, pct}, ...]
+ * @returns {Array<Object>} At most SEASON_PCT_WEEKS records, best first.
+ */
+function computeBest16Weeks(weekRecords) {
+  const sorted = (weekRecords || []).slice().sort((a, b) => {
+    if (b.pct !== a.pct) return b.pct - a.pct;      // better percentage first
+    if (b.games !== a.games) return b.games - a.games; // same percentage: more games wins
+    return a.week - b.week;                          // still tied: earliest week, for determinism
+  });
+  return sorted.length <= SEASON_PCT_WEEKS ? sorted : sorted.slice(0, SEASON_PCT_WEEKS);
+}
+
+/**
+ * Pools the chosen weeks into one score. Y is pooled correct over pooled games -- NOT the
+ * average of the weekly percentages, which would weight a 12-game week the same as a 16-game one.
+ *
+ * @param {Array<Object>} weekRecords Every eligible week for one player.
+ * @returns {Object} {chosenWeeks, W, X, Y}
+ */
+function seasonBest16Score(weekRecords) {
+  const chosen = computeBest16Weeks(weekRecords);
+  const W = chosen.reduce((sum, r) => sum + r.correct, 0);
+  const X = chosen.reduce((sum, r) => sum + r.games, 0);
+  return { chosenWeeks: chosen, W: W, X: X, Y: X > 0 ? W / X : 0 };
+}
+
+/**
+ * Pot for one pool. Weekly pools return the pot for a SINGLE week.
+ *
+ * @param {string} key Pool key from POOLS.
+ * @param {number} entries Paid entries.
+ * @returns {number} Dollar amount.
+ */
+function poolPot(key, entries) {
+  const pool = POOLS.find(p => p.key === key);
+  if (!pool) return 0;
+  const count = Number(entries) || 0;
+  return pool.cadence === 'weekly' ? pool.fee * count : pool.fee * pool.weeks * count;
+}
+
+/**
+ * Everything the payout tabs need, computed once from the weekly sheets.
+ *
+ * @param {Spreadsheet} [ss] Optional spreadsheet handle.
+ * @returns {Object} Rosters, per-week results, and per-pool money.
+ */
+function computePayouts(ss) {
+  ss = fetchSpreadsheet(ss);
+  const memberData = fetchProperties('members') || { memberOrder: [], members: {} };
+  const teams = memberData.memberOrder.map(id => memberData.members[id]);
+  const names = teams.map(m => (m && m.name) ? m.name.toString() : '').filter(Boolean);
+  const entries = names.length;
+
+  const regularWeeks = Array.from({ length: REGULAR_SEASON }, (_, i) => i + 1);
+  const ladder = payoutLadder(entries);
+  const weeklyPot = poolPot('weeklyWins', entries);
+  const consensusPot = poolPot('weeklyConsensus', entries);
+
+  const blank = () => { const o = {}; names.forEach(n => o[n] = 0); return o; };
+  const result = {
+    names: names, entries: entries, ladder: ladder,
+    weeklyPot: weeklyPot, consensusPot: consensusPot,
+    weeklyMoney: {}, consensusMoney: {}, weeklyPoints: {}, weeklyPlaces: {}, perfectWeekEntries: {},
+    totals: { weeklyWins: blank(), weeklyConsensus: blank(), seasonPoints: blank(), perfectWeek: blank(),
+              seasonConsensus: blank(), postSeason: blank(), seasonPct: blank() },
+    seasonPointsTotal: blank(),
+    seasonCorrectTotal: blank(),
+    weeklyCorrect: {}, gamesPerWeek: {}, seasonPct: {},
+    weeklyCorrectRank: {}, seasonRunningCorrect: {}, seasonCorrectRank: {},
+    playoffPoints: {}, playoffPointsTotal: blank(),
+    seasonConsensusTotal: 0, seasonConsensusWinners: [],
+    perfectWeekWinners: [],
+    weeksScored: []
+  };
+
+  regularWeeks.forEach(week => {
+    const week_ = weeklyResults(week, ss);
+    if (!week_) return;                       // week not finished: no money, no points
+    result.weeksScored.push(week);
+
+    // --- Weekly Wins: ladder money, ties consuming places below
+    const sizes = week_.groups.map(g => g.names.length);
+    const perPerson = distributeTieredPot(weeklyPot, sizes, ladder);
+    const flat = [];
+    let placeCounter = 1;
+    const places = {};
+    week_.groups.forEach((g, i) => {
+      g.names.forEach(n => {
+        places[n] = placeCounter;                 // every member of a tied group shares the place
+        flat.push({ name: n, amount: perPerson[i] });
+      });
+      placeCounter += g.names.length;             // ties consume the places below them
+    });
+    roundPayoutsToCents(flat, weeklyPot);
+    const money = {};
+    flat.forEach(p => {
+      money[p.name] = p.amount;
+      result.totals.weeklyWins[p.name] = (result.totals.weeklyWins[p.name] || 0) + p.amount;
+    });
+    result.weeklyMoney[week] = money;
+    result.weeklyPlaces[week] = places;
+
+    // --- Season points: tiers by weekly POINTS (bonus game included), tiebreakers ignored
+    const pointsByName = {};
+    week_.groups.forEach(g => g.names.forEach(n => pointsByName[n] = g.points));
+    const pts = weeklyPlacementPoints(pointsByName);
+    result.weeklyPoints[week] = pts;
+
+    // Raw correct picks accumulate separately: the season consensus pool ignores the bonus game
+    week_.groups.forEach(g => g.names.forEach(n =>
+      result.seasonCorrectTotal[n] = (result.seasonCorrectTotal[n] || 0) + g.correct));
+
+    // Pool 3 needs correct AND games per week, kept apart from the bonus-weighted points
+    result.gamesPerWeek[week] = week_.matchups;
+    const correctThisWeek = {};
+    week_.groups.forEach(g => g.names.forEach(n => correctThisWeek[n] = g.correct));
+    result.weeklyCorrect[week] = correctThisWeek;
+    const crowd = consensusWeeklyCorrect(week, ss);
+    if (crowd) result.seasonConsensusTotal += crowd.adjusted;
+    Object.keys(pts).forEach(n => result.seasonPointsTotal[n] = (result.seasonPointsTotal[n] || 0) + pts[n]);
+
+    // --- Weekly Consensus: even split among those who beat the crowd, refund if none
+    const flagRange = ss.getRangeByName(`${LEAGUE}_CONSENSUS_${week}`);
+    const nameRange = ss.getRangeByName(`NAMES_${week}`);
+    if (flagRange && nameRange) {
+      const flags = flagRange.getValues().flat();
+      const weekNames = nameRange.getValues().flat();
+      const winners = [];
+      weekNames.forEach((n, i) => { if (n && Number(flags[i]) === 1) winners.push(n.toString()); });
+      const split = distributeOrRefund(consensusPot, winners.length, entries);
+      const paidTo = split.refunded ? names : winners;
+      const cFlat = paidTo.map(n => ({ name: n, amount: split.each }));
+      roundPayoutsToCents(cFlat, consensusPot);
+      const cMoney = {};
+      cFlat.forEach(p => {
+        cMoney[p.name] = p.amount;
+        result.totals.weeklyConsensus[p.name] = (result.totals.weeklyConsensus[p.name] || 0) + p.amount;
+      });
+      result.consensusMoney[week] = { money: cMoney, winners: winners.length, refunded: split.refunded };
+    }
+
+    // --- Perfect Week: every game correct. Each perfect week is a separate entry into the
+    // end-of-season split, so two perfect weeks earns twice the share of one.
+    week_.perfect.forEach(n => {
+      result.perfectWeekEntries[n] = (result.perfectWeekEntries[n] || 0) + 1;
+      if (result.perfectWeekWinners.indexOf(n) === -1) result.perfectWeekWinners.push(n);
+    });
+  });
+
+  // Every season-long pool keys off the same question: is the regular season finished?
+  const pctWeeksComplete = Object.keys(result.weeklyCorrect).length >= REGULAR_SEASON;
+
+  // --- Season Points money: rank by total points, ties consume places below
+  const ranked = names.slice().sort((a, b) => result.seasonPointsTotal[b] - result.seasonPointsTotal[a]);
+  const pointGroups = [];
+  ranked.forEach(n => {
+    const last = pointGroups[pointGroups.length - 1];
+    if (last && result.seasonPointsTotal[last.names[0]] === result.seasonPointsTotal[n]) last.names.push(n);
+    else pointGroups.push({ names: [n] });
+  });
+  const spPot = poolPot('seasonPoints', entries);
+  result.seasonPointsPotGated = true;
+  // Season-long pools show standings all the way through but only pay when their period closes,
+  // so a dollar figure anywhere in this workbook is money actually won.
+  if (pctWeeksComplete) {
+    const spEach = distributeTieredPot(spPot, pointGroups.map(g => g.names.length), ladder);
+    const spFlat = [];
+    pointGroups.forEach((g, i) => g.names.forEach(n => spFlat.push({ name: n, amount: spEach[i] })));
+    roundPayoutsToCents(spFlat, spPot);
+    spFlat.forEach(p => result.totals.seasonPoints[p.name] = p.amount);
+  }
+  result.seasonPointsGroups = pointGroups;
+  result.seasonPointsPot = spPot;
+
+  // --- Weekly and season rank grids, both on raw correct picks (no tiebreakers, no bonus).
+  // Ties share a rank, which is why these can disagree with Wkly Payout -- that pays on
+  // bonus-inclusive points with tiebreakers, while these answer "who picked best".
+  const rankWeeks = Object.keys(result.weeklyCorrect).map(Number).sort((a, b) => a - b);
+  const running = {};
+  rankWeeks.forEach(week => {
+    result.weeklyCorrectRank[week] = competitionRanks(result.weeklyCorrect[week]);
+    const cumulative = {};
+    names.forEach(n => {
+      const thisWeek = result.weeklyCorrect[week][n];
+      running[n] = (running[n] || 0) + ((thisWeek === undefined || thisWeek === null) ? 0 : thisWeek);
+      cumulative[n] = running[n];
+    });
+    result.seasonRunningCorrect[week] = cumulative;
+    result.seasonCorrectRank[week] = competitionRanks(cumulative);
+  });
+  result.rankWeeks = rankWeeks;
+
+  // --- Season % Correct (best 16 weeks). A week a member skipped counts as 0 correct against
+  // that week's full denominator, so it lands at 0% and is almost always one of the two dropped.
+  const pctWeeks = Object.keys(result.weeklyCorrect).map(Number).sort((a, b) => a - b);
+  names.forEach(n => {
+    const records = pctWeeks.map(week => {
+      const correct = result.weeklyCorrect[week][n];
+      const games = result.gamesPerWeek[week];
+      const scored = (correct === undefined || correct === null) ? 0 : correct; // missed week = 0
+      return { week: week, correct: scored, games: games, pct: games > 0 ? scored / games : 0 };
+    }).filter(r => r.games > 0);
+    result.seasonPct[n] = seasonBest16Score(records);
+  });
+  result.seasonPctWeeksAvailable = pctWeeks.length;
+  result.regularSeasonComplete = pctWeeks.length >= REGULAR_SEASON;
+
+  const pctPot = poolPot('seasonPct', entries);
+  result.seasonPctPot = pctPot;
+  // Like the playoff pool, this only pays once its period is over -- until then the tab shows
+  // W/X/Y and a provisional rank so members can track where they stand.
+  if (result.regularSeasonComplete) {
+    const pctRanked = names.slice().sort((a, b) => result.seasonPct[b].Y - result.seasonPct[a].Y);
+    const pctGroups = [];
+    pctRanked.forEach(n => {
+      const last = pctGroups[pctGroups.length - 1];
+      if (last && result.seasonPct[last.names[0]].Y === result.seasonPct[n].Y) last.names.push(n);
+      else pctGroups.push({ names: [n] });
+    });
+    const pctEach = distributeTieredPot(pctPot, pctGroups.map(g => g.names.length), ladder);
+    const pctFlat = [];
+    pctGroups.forEach((g, i) => g.names.forEach(n => pctFlat.push({ name: n, amount: pctEach[i] })));
+    roundPayoutsToCents(pctFlat, pctPot);
+    pctFlat.forEach(p => result.totals.seasonPct[p.name] = p.amount);
+  }
+
+  // One worked example in the log, so the best-16 maths can be checked by hand
+  if (names.length && result.seasonPct[names[0]]) {
+    const sample = result.seasonPct[names[0]];
+    Logger.log(`📊 Best-16 example for "${names[0]}": kept ${sample.chosenWeeks.length} of ${pctWeeks.length} eligible weeks ` +
+      `(${sample.chosenWeeks.map(r => `wk${r.week} ${r.correct}/${r.games}`).join(', ')}) ` +
+      `-> W=${sample.W}, X=${sample.X}, Y=${(sample.Y * 100).toFixed(2)}%`);
+  }
+
+  // --- Season Consensus: beat the crowd's season total outright, on raw correct picks.
+  // Even split among winners, refunded to everyone if the crowd wins.
+  const scPot = poolPot('seasonConsensus', entries);
+  result.seasonConsensusWinners = names.filter(n => (result.seasonCorrectTotal[n] || 0) > result.seasonConsensusTotal);
+  const scSplit = distributeOrRefund(scPot, result.seasonConsensusWinners.length, entries);
+  if (pctWeeksComplete) {
+    const scFlat = (scSplit.refunded ? names : result.seasonConsensusWinners).map(n => ({ name: n, amount: scSplit.each }));
+    roundPayoutsToCents(scFlat, scPot);
+    scFlat.forEach(p => result.totals.seasonConsensus[p.name] = p.amount);
+  }
+  result.seasonConsensusPot = scPot;
+  result.seasonConsensusRefunded = scSplit.refunded;
+
+  // --- Post Season: same 5/4/3/2/1 tiers as the season points pool, over the playoff weeks only,
+  // carried as one cumulative total rather than weekly pots.
+  PLAYOFF_WEEKS.forEach(week => {
+    const playoff = weeklyResults(week, ss);
+    if (!playoff) return;
+    const byName = {};
+    playoff.groups.forEach(g => g.names.forEach(n => byName[n] = g.points));
+    const pts = weeklyPlacementPoints(byName);
+    result.playoffPoints[week] = pts;
+    Object.keys(pts).forEach(n => result.playoffPointsTotal[n] = (result.playoffPointsTotal[n] || 0) + pts[n]);
+  });
+  const playoffScored = Object.keys(result.playoffPoints).length;
+  const psPot = poolPot('postSeason', entries);
+  result.postSeasonPot = psPot;
+  result.playoffWeeksScored = playoffScored;
+  result.playoffComplete = playoffScored === PLAYOFF_WEEKS.length;
+  // Points accumulate visibly all through the playoffs, but the pot is only awarded once
+  // every playoff week is scored -- nobody sees dollars they have not won yet.
+  if (result.playoffComplete) {
+    const psRanked = names.slice().sort((a, b) => result.playoffPointsTotal[b] - result.playoffPointsTotal[a]);
+    const psGroups = [];
+    psRanked.forEach(n => {
+      const last = psGroups[psGroups.length - 1];
+      if (last && result.playoffPointsTotal[last.names[0]] === result.playoffPointsTotal[n]) last.names.push(n);
+      else psGroups.push({ names: [n] });
+    });
+    const psEach = distributeTieredPot(psPot, psGroups.map(g => g.names.length), ladder);
+    const psFlat = [];
+    psGroups.forEach((g, i) => g.names.forEach(n => psFlat.push({ name: n, amount: psEach[i] })));
+    roundPayoutsToCents(psFlat, psPot);
+    psFlat.forEach(p => result.totals.postSeason[p.name] = p.amount);
+  }
+
+  // --- Perfect Week money: shares are proportional to how many perfect weeks a member had,
+  // so two perfect weeks against somebody else's one splits the pot 2/3 to 1/3. Nobody perfect
+  // all season means the pot is refunded evenly.
+  const pwPot = poolPot('perfectWeek', entries);
+  const totalEntries = Object.keys(result.perfectWeekEntries)
+    .reduce((sum, n) => sum + result.perfectWeekEntries[n], 0);
+  const pwFlat = [];
+  if (totalEntries > 0) {
+    Object.keys(result.perfectWeekEntries).forEach(n =>
+      pwFlat.push({ name: n, amount: pwPot * (result.perfectWeekEntries[n] / totalEntries) }));
+    result.perfectWeekRefunded = false;
+  } else {
+    names.forEach(n => pwFlat.push({ name: n, amount: entries ? pwPot / entries : 0 }));
+    result.perfectWeekRefunded = true;
+  }
+  roundPayoutsToCents(pwFlat, pwPot);
+  pwFlat.forEach(p => result.totals.perfectWeek[p.name] = p.amount);
+  result.perfectWeekPot = pwPot;
+  result.perfectWeekShares = totalEntries;
+
+  return result;
+}
+
+/** Shared look and feel for the money grids. */
+function styleMoneyGrid(sheet, rows, cols, moneyRange) {
+  const all = sheet.getRange(1, 1, rows, cols);
+  all.setHorizontalAlignment('center').setVerticalAlignment('middle').setFontFamily('Montserrat').setFontSize(10);
+  sheet.getRange(1, 1, rows, 1).setHorizontalAlignment('left');
+  sheet.getRange(1, 1, 1, cols).setBackground('black').setFontColor('white').setFontWeight('bold');
+  sheet.getRange(rows, 1, 1, cols).setBackground('#e6e6e6').setFontWeight('bold');
+  sheet.setColumnWidth(1, 150);
+  sheet.setColumnWidth(2, 80);
+  sheet.setFrozenColumns(2);
+  sheet.setFrozenRows(1);
+  if (moneyRange) moneyRange.setNumberFormat('$#,##0.00;[Red]-$#,##0.00;""');
+}
+
+/**
+ * WKLY PAYOUT -- dollars won in the main weekly pick 'em, week by week.
+ */
+function wklyPayoutSheet(ss, data) {
+  ss = fetchSpreadsheet(ss);
+  data = data || computePayouts(ss);
+  const weeks = Array.from({ length: REGULAR_SEASON }, (_, i) => i + 1);
+  const names = data.names;
+  const rows = names.length + 2, cols = weeks.length + 2;
+
+  let sheet = ss.getSheetByName('Wkly Payout') || ss.insertSheet('Wkly Payout');
+  sheet.clear();
+  sheet.setTabColor(winnersTabColor);
+  adjustRows(sheet, rows); adjustColumns(sheet, cols);
+
+  const header = ['Team', 'Total'].concat(weeks.map(w => `WK${w}`));
+  sheet.getRange(1, 1, 1, cols).setValues([header]);
+
+  const body = names.map(n => [n, data.totals.weeklyWins[n] || 0]
+    .concat(weeks.map(w => (data.weeklyMoney[w] && data.weeklyMoney[w][n]) ? data.weeklyMoney[w][n] : '')));
+  if (body.length) sheet.getRange(2, 1, body.length, cols).setValues(body);
+
+  const totalRow = ['Pot', names.reduce((s, n) => s + (data.totals.weeklyWins[n] || 0), 0)]
+    .concat(weeks.map(w => data.weeklyMoney[w] ? data.weeklyPot : ''));
+  sheet.getRange(rows, 1, 1, cols).setValues([totalRow]);
+
+  styleMoneyGrid(sheet, rows, cols, sheet.getRange(2, 2, rows - 1, cols - 1));
+  sheet.getRange(1, 1).setNote(`Dollars won in the main weekly pick 'ems. ${data.ladder.length} places paid at ${data.ladder.join('/')}% of each week's $${data.weeklyPot.toFixed(2)} pot. Tied members take the places below them and split the combined money. Blank means the week is not fully scored yet. Refreshed by "Update Payouts".`);
+  return sheet;
+}
+
+/**
+ * WKLY CONSENSUS -- dollars won for beating the crowd, week by week.
+ */
+function wklyConsensusPayoutSheet(ss, data) {
+  ss = fetchSpreadsheet(ss);
+  data = data || computePayouts(ss);
+  const weeks = Array.from({ length: REGULAR_SEASON }, (_, i) => i + 1);
+  const names = data.names;
+  const rows = names.length + 3, cols = weeks.length + 2;
+
+  let sheet = ss.getSheetByName('Wkly Consensus') || ss.insertSheet('Wkly Consensus');
+  sheet.clear();
+  sheet.setTabColor(generalTabColor);
+  adjustRows(sheet, rows); adjustColumns(sheet, cols);
+
+  sheet.getRange(1, 1, 1, cols).setValues([['Team', 'Total'].concat(weeks.map(w => `WK${w}`))]);
+
+  const body = names.map(n => [n, data.totals.weeklyConsensus[n] || 0]
+    .concat(weeks.map(w => (data.consensusMoney[w] && data.consensusMoney[w].money[n]) ? data.consensusMoney[w].money[n] : '')));
+  if (body.length) sheet.getRange(2, 1, body.length, cols).setValues(body);
+
+  const winnersRow = ['Winners', ''].concat(weeks.map(w => data.consensusMoney[w]
+    ? (data.consensusMoney[w].refunded ? 'refund' : data.consensusMoney[w].winners) : ''));
+  sheet.getRange(rows - 1, 1, 1, cols).setValues([winnersRow]);
+
+  const potRow = ['Pot', names.reduce((s, n) => s + (data.totals.weeklyConsensus[n] || 0), 0)]
+    .concat(weeks.map(w => data.consensusMoney[w] ? data.consensusPot : ''));
+  sheet.getRange(rows, 1, 1, cols).setValues([potRow]);
+
+  styleMoneyGrid(sheet, rows, cols, sheet.getRange(2, 2, names.length, cols - 1));
+  sheet.getRange(rows - 1, 1, 1, cols).setBackground('#f3f3f3');
+  sheet.getRange(1, 1).setNote(`Dollars won for finishing with strictly more correct picks than the group's consensus row. Each week's $${data.consensusPot.toFixed(2)} pot is split evenly among the winners; if nobody beats the consensus the pot is refunded evenly to every entrant and the Winners row reads "refund". Refreshed by "Update Payouts".`);
+  return sheet;
+}
+
+/**
+ * SEASON POINTS -- weekly 5/4/3/2/1 tiers, season total, rank, and money.
+ */
+function seasonPointsSheet(ss, data) {
+  ss = fetchSpreadsheet(ss);
+  data = data || computePayouts(ss);
+  const weeks = Array.from({ length: REGULAR_SEASON }, (_, i) => i + 1);
+  const names = data.names.slice().sort((a, b) => data.seasonPointsTotal[b] - data.seasonPointsTotal[a]);
+  const leader = names.length ? data.seasonPointsTotal[names[0]] : 0;
+  const rows = names.length + 1, cols = weeks.length + 5;
+
+  let sheet = ss.getSheetByName('Season Points') || ss.insertSheet('Season Points');
+  sheet.clear();
+  sheet.setTabColor(winnersTabColor);
+  adjustRows(sheet, rows); adjustColumns(sheet, cols);
+
+  sheet.getRange(1, 1, 1, cols).setValues([['Team', 'Rank', '$ Won', 'Off Lead', 'Total Points']
+    .concat(weeks.map(w => `WK${w}`))]);
+
+  // Rank shares a number across ties, and the next distinct total skips ahead
+  let rank = 0, seen = null, shown = 0;
+  const body = names.map(n => {
+    shown++;
+    if (data.seasonPointsTotal[n] !== seen) { rank = shown; seen = data.seasonPointsTotal[n]; }
+    return [n, rank, data.totals.seasonPoints[n] || 0,
+            data.seasonPointsTotal[n] - leader === 0 ? '' : data.seasonPointsTotal[n] - leader,
+            data.seasonPointsTotal[n]]
+      .concat(weeks.map(w => (data.weeklyPoints[w] && data.weeklyPoints[w][n] !== undefined) ? data.weeklyPoints[w][n] : ''));
+  });
+  if (body.length) sheet.getRange(2, 1, body.length, cols).setValues(body);
+
+  const all = sheet.getRange(1, 1, rows, cols);
+  all.setHorizontalAlignment('center').setVerticalAlignment('middle').setFontFamily('Montserrat').setFontSize(10);
+  sheet.getRange(1, 1, rows, 1).setHorizontalAlignment('left');
+  sheet.getRange(1, 1, 1, cols).setBackground('black').setFontColor('white').setFontWeight('bold');
+  sheet.getRange(2, 3, Math.max(names.length, 1), 1).setNumberFormat('$#,##0.00;[Red]-$#,##0.00;""');
+  sheet.setColumnWidth(1, 150);
+  sheet.setFrozenColumns(5);
+  sheet.setFrozenRows(1);
+  sheet.getRange(1, 1).setNote(`Weekly tiers of 5/4/3/2/1 by correct picks only -- tiebreakers are not used here. Tied members all take that tier's full points and the next distinct score drops a tier. Season pot of $${data.seasonPointsPot.toFixed(2)} pays ${data.ladder.length} places at ${data.ladder.join('/')}%, with ties consuming the places below. Points show all season; the money is only assigned once all ${REGULAR_SEASON} regular-season weeks are scored. Refreshed by "Update Payouts".`);
+  return sheet;
+}
+
+/**
+ * SUMMARY PAYOUT -- every member's money across every pool, plus the fee schedule
+ * block that defines each pot. This tab is the one members read to see where they stand.
+ */
+function summaryPayoutSheet(ss, data) {
+  ss = fetchSpreadsheet(ss);
+  data = data || computePayouts(ss);
+  const memberData = fetchProperties('members') || { memberOrder: [], members: {} };
+  const byName = {};
+  memberData.memberOrder.forEach(id => {
+    const m = memberData.members[id];
+    if (m && m.name) byName[m.name.toString()] = m;
+  });
+
+  const poolCols = POOLS.map(p => p.label);
+  const header = ['Team', 'Manager', 'Won'].concat(poolCols).concat(['Entry', 'Fines', 'Net', 'Paid']);
+  const names = data.names;
+  const firstPool = 4;                       // column D
+  const cols = header.length;
+  const configTop = names.length + 3;        // one blank row after the roster
+  const rows = configTop + 7;
+
+  let sheet = ss.getSheetByName('Summary Payout') || ss.insertSheet('Summary Payout');
+  sheet.clear();
+  sheet.setTabColor(configTabColor);
+  adjustRows(sheet, rows); adjustColumns(sheet, cols);
+  sheet.getRange(1, 1, 1, cols).setValues([header]);
+
+  const entryTotal = POOLS.reduce((s, p) => s + p.fee * p.weeks, 0);
+  const body = names.map(n => {
+    const m = byName[n] || {};
+    const won = POOLS.map(p => {
+      if (p.key === 'weeklyWins') return data.totals.weeklyWins[n] || 0;
+      if (p.key === 'weeklyConsensus') return data.totals.weeklyConsensus[n] || 0;
+      if (p.key === 'seasonPoints') return data.totals.seasonPoints[n] || 0;
+      if (p.key === 'perfectWeek') return data.totals.perfectWeek[n] || 0;
+      if (p.key === 'seasonConsensus') return data.totals.seasonConsensus[n] || 0;
+      if (p.key === 'postSeason') return data.totals.postSeason[n] || 0;
+      if (p.key === 'seasonPct') return data.totals.seasonPct[n] || 0;
+      return '';
+    });
+    return [n, m.manager || ''].concat([''], won, [entryTotal, '', '', m.paid ? 'YES' : '']);
+  });
+  if (body.length) sheet.getRange(2, 1, body.length, cols).setValues(body);
+
+  // Won = sum of the pool columns; Net = Won - Entry - Fines
+  names.forEach((n, i) => {
+    const r = i + 2;
+    sheet.getRange(r, 3).setFormula(`=IFERROR(SUM(${sheet.getRange(r, firstPool).getA1Notation()}:${sheet.getRange(r, firstPool + POOLS.length - 1).getA1Notation()}),0)`);
+    const entryCell = sheet.getRange(r, firstPool + POOLS.length).getA1Notation();
+    const finesCell = sheet.getRange(r, firstPool + POOLS.length + 1).getA1Notation();
+    sheet.getRange(r, firstPool + POOLS.length + 2)
+      .setFormula(`=IFERROR(C${r}-${entryCell}-N(${finesCell}),)`);
+  });
+
+  // Fee schedule block -- the definition of every pot, mirroring the 2025 layout
+  const labels = ['cost per entry per week', 'Weeks', 'Total per entry', 'Entries', 'POT', '% of total pot'];
+  const totalPot = POOLS.reduce((s, p) => s + p.fee * p.weeks * data.entries, 0);
+  labels.forEach((label, i) => {
+    const r = configTop + i;
+    sheet.getRange(r, 2).setValue(label);
+    POOLS.forEach((p, c) => {
+      const col = firstPool + c;
+      let v = '';
+      if (i === 0) v = p.fee;
+      if (i === 1) v = p.weeks;
+      if (i === 2) v = p.fee * p.weeks;
+      if (i === 3) v = data.entries;
+      if (i === 4) v = p.fee * p.weeks * data.entries;
+      if (i === 5) v = totalPot ? (p.fee * p.weeks * data.entries) / totalPot : 0;
+      sheet.getRange(r, col).setValue(v);
+    });
+  });
+  sheet.getRange(configTop + 2, 3).setValue(entryTotal);
+  sheet.getRange(configTop + 4, 3).setValue(totalPot);
+  sheet.getRange(configTop + 5, firstPool, 1, POOLS.length).setNumberFormat('0%');
+  sheet.getRange(configTop, firstPool, 1, POOLS.length).setNumberFormat('$#,##0.00');
+  sheet.getRange(configTop + 2, firstPool, 1, POOLS.length).setNumberFormat('$#,##0.00');
+  sheet.getRange(configTop + 4, firstPool, 1, POOLS.length).setNumberFormat('$#,##0.00');
+  sheet.getRange(configTop + 2, 3).setNumberFormat('$#,##0.00');
+  sheet.getRange(configTop + 4, 3).setNumberFormat('$#,##0.00');
+
+  const all = sheet.getRange(1, 1, rows, cols);
+  all.setHorizontalAlignment('center').setVerticalAlignment('middle').setFontFamily('Montserrat').setFontSize(10);
+  sheet.getRange(1, 1, rows, 2).setHorizontalAlignment('left');
+  sheet.getRange(1, 1, 1, cols).setBackground('black').setFontColor('white').setFontWeight('bold').setWrap(true);
+  sheet.setRowHeight(1, 44);
+  if (names.length) {
+    sheet.getRange(2, 3, names.length, POOLS.length + 3).setNumberFormat('$#,##0.00;[Red]-$#,##0.00;""');
+    sheet.getRange(2, 3, names.length, 1).setFontWeight('bold');
+  }
+  sheet.getRange(configTop, 1, 6, cols).setBackground('#f3f3f3');
+  sheet.setColumnWidth(1, 150);
+  sheet.setColumnWidth(2, 130);
+  sheet.setFrozenColumns(2);
+  sheet.setFrozenRows(1);
+
+  sheet.getRange(1, firstPool + POOLS.length + 1).setNote(`Manual column. Type any fine owed and it is subtracted from that member's Net.`);
+  sheet.getRange(1, 3).setNote(`Total won across every pool. Net subtracts the entry fee and any fines.`);
+  sheet.getRange(configTop, 2).setNote(`This block defines every pot: fee per entry per week x weeks x entries. Change a fee here and re-run "Update Payouts" to push it through every tab.`);
+  return sheet;
+}
+
+/**
+ * Writes each member's finishing place into the Place column of every scored weekly sheet,
+ * so the WK sheet and Wkly Payout tell the same story. Place 1 still means first, which keeps
+ * the WINNERS tab (which joins names where the place equals 1) working unchanged.
+ */
+function writeWeeklyPlaces(ss, data) {
+  Object.keys(data.weeklyPlaces).forEach(week => {
+    const nameRange = ss.getRangeByName(`NAMES_${week}`);
+    const placeRange = ss.getRangeByName(`WIN_${week}`);
+    if (!nameRange || !placeRange) return;
+    const names = nameRange.getValues().flat();
+    const places = data.weeklyPlaces[week];
+    placeRange.setValues(names.map(n => {
+      const key = n ? n.toString() : '';
+      return [(key && places[key]) ? places[key] : ''];
+    }));
+  });
+}
+
+/**
+ * Builds the payout tabs without any dialogs, for use during initial setup.
+ */
+function updatePayoutSheetsQuietly(ss) {
+  ss = fetchSpreadsheet(ss);
+  try {
+    const data = computePayouts(ss);
+    if (!data.entries) return;
+    writeWeeklyPlaces(ss, data);
+    wklyPayoutSheet(ss, data);
+    wklyConsensusPayoutSheet(ss, data);
+    seasonPointsSheet(ss, data);
+    seasonTotalsSheet(ss, data);
+    if (data.playoffWeeksScored) playoffPointsSheet(ss, data);
+    summaryPayoutSheet(ss, data);
+    standingsSheet(ss, data);
+    wklyRankSheet(ss, data);
+    seasonRankSheet(ss, data);
+    rankJumpChartSheet(ss, data);
+  } catch (err) {
+    Logger.log(`⚠️ Could not deploy payout sheets: ${err.stack}`);
+  }
+}
+
+/**
+ * PLAYOFF POINTS -- the Post Season pool: 5/4/3/2/1 per playoff week, one cumulative total.
+ */
+function playoffPointsSheet(ss, data) {
+  ss = fetchSpreadsheet(ss);
+  data = data || computePayouts(ss);
+  const names = data.names.slice().sort((a, b) => data.playoffPointsTotal[b] - data.playoffPointsTotal[a]);
+  const rows = names.length + 1, cols = PLAYOFF_WEEKS.length + 3;
+
+  let sheet = ss.getSheetByName('Playoff Points') || ss.insertSheet('Playoff Points');
+  sheet.clear();
+  sheet.setTabColor(winnersTabColor);
+  adjustRows(sheet, rows); adjustColumns(sheet, cols);
+
+  const roundName = { 19: 'Wild Card', 20: 'Divisional', 21: 'Conference', 23: 'Super Bowl' };
+  sheet.getRange(1, 1, 1, cols).setValues([['Team', 'Rank', 'Total Points']
+    .concat(PLAYOFF_WEEKS.map(w => roundName[w] || `WK${w}`))]);
+
+  let rank = 0, seen = null, shown = 0;
+  const body = names.map(n => {
+    shown++;
+    if (data.playoffPointsTotal[n] !== seen) { rank = shown; seen = data.playoffPointsTotal[n]; }
+    return [n, rank, data.playoffPointsTotal[n] || 0]
+      .concat(PLAYOFF_WEEKS.map(w => (data.playoffPoints[w] && data.playoffPoints[w][n] !== undefined) ? data.playoffPoints[w][n] : ''));
+  });
+  if (body.length) sheet.getRange(2, 1, body.length, cols).setValues(body);
+
+  const all = sheet.getRange(1, 1, rows, cols);
+  all.setHorizontalAlignment('center').setVerticalAlignment('middle').setFontFamily('Montserrat').setFontSize(10);
+  sheet.getRange(1, 1, rows, 1).setHorizontalAlignment('left');
+  sheet.getRange(1, 1, 1, cols).setBackground('black').setFontColor('white').setFontWeight('bold').setWrap(true);
+  if (names.length) sheet.getRange(2, 3, names.length, 1).setFontWeight('bold');
+  sheet.setColumnWidth(1, 150);
+  sheet.setFrozenColumns(3);
+  sheet.setFrozenRows(1);
+  sheet.getRange(1, 1).setNote(`Separate entry from the regular season. Each playoff week awards 5/4/3/2/1 by points and ties share a tier, so this is a running total you can track as the playoffs go. Money is deliberately not shown here -- the $${data.postSeasonPot.toFixed(2)} pot pays ${data.ladder.length} places at ${data.ladder.join('/')}% only once all ${PLAYOFF_WEEKS.length} playoff weeks are scored, and it appears on Summary Payout and Standings then. ${data.playoffWeeksScored} of ${PLAYOFF_WEEKS.length} playoff weeks scored so far.`);
+  return sheet;
+}
+
+/**
+ * Shared builder for the two rank grids. Both are members x weeks with a rank in each cell.
+ */
+function buildRankGrid(ss, tabName, data, rankByWeek, currentValueByName, noteText) {
+  const weeks = Array.from({ length: REGULAR_SEASON }, (_, i) => i + 1);
+  const latest = data.rankWeeks.length ? data.rankWeeks[data.rankWeeks.length - 1] : null;
+  const finalRank = latest ? rankByWeek[latest] : {};
+  const names = data.names.slice().sort((a, b) =>
+    (finalRank[a] || 999) - (finalRank[b] || 999) || a.localeCompare(b));
+  const rows = names.length + 1, cols = weeks.length + 2;
+
+  let sheet = ss.getSheetByName(tabName) || ss.insertSheet(tabName);
+  sheet.clear();
+  sheet.setTabColor(generalTabColor);
+  adjustRows(sheet, rows); adjustColumns(sheet, cols);
+
+  sheet.getRange(1, 1, 1, cols).setValues([['Team', 'Now'].concat(weeks.map(w => `WK${w}`))]);
+  const body = names.map(n => [n, (finalRank[n] === undefined ? '' : finalRank[n])]
+    .concat(weeks.map(w => (rankByWeek[w] && rankByWeek[w][n] !== undefined) ? rankByWeek[w][n] : '')));
+  if (body.length) sheet.getRange(2, 1, body.length, cols).setValues(body);
+
+  const all = sheet.getRange(1, 1, rows, cols);
+  all.setHorizontalAlignment('center').setVerticalAlignment('middle').setFontFamily('Montserrat').setFontSize(10);
+  sheet.getRange(1, 1, rows, 1).setHorizontalAlignment('left');
+  sheet.getRange(1, 1, 1, cols).setBackground('black').setFontColor('white').setFontWeight('bold');
+  sheet.setColumnWidth(1, 150);
+  sheet.setColumnWidth(2, 50);
+  sheet.setColumnWidths(3, weeks.length, 34);
+  sheet.setFrozenColumns(2);
+  sheet.setFrozenRows(1);
+
+  // Rank 1 is best, so the gradient runs dark-to-light from the top
+  if (names.length) {
+    sheet.clearConditionalFormatRules();
+    sheet.setConditionalFormatRules([SpreadsheetApp.newConditionalFormatRule()
+      .setGradientMaxpointWithValue('#FFFFFF', SpreadsheetApp.InterpolationType.NUMBER, String(names.length))
+      .setGradientMinpointWithValue('#5EDCFF', SpreadsheetApp.InterpolationType.NUMBER, '1')
+      .setRanges([sheet.getRange(2, 2, names.length, cols - 1)])
+      .build()]);
+  }
+  sheet.getRange(1, 1).setNote(noteText);
+  return { sheet: sheet, names: names, rows: rows, cols: cols };
+}
+
+/**
+ * WKLY RANK -- where each member finished each week on raw correct picks alone.
+ */
+function wklyRankSheet(ss, data) {
+  ss = fetchSpreadsheet(ss);
+  data = data || computePayouts(ss);
+  const latest = data.rankWeeks.length ? data.rankWeeks[data.rankWeeks.length - 1] : null;
+  return buildRankGrid(ss, 'Wkly Rank', data, data.weeklyCorrectRank,
+    latest ? data.weeklyCorrectRank[latest] : {},
+    `Each week's finishing order by correct picks only -- no tiebreakers and no bonus game, so ties share a rank. This answers "who picked best". It can differ from Wkly Payout, which pays on bonus-inclusive points with the tiebreakers applied. "Now" is the most recent scored week.`).sheet;
+}
+
+/**
+ * SEASON RANK -- running position by cumulative correct picks after each week.
+ */
+function seasonRankSheet(ss, data) {
+  ss = fetchSpreadsheet(ss);
+  data = data || computePayouts(ss);
+  return buildRankGrid(ss, 'Season Rank', data, data.seasonCorrectRank, {},
+    `Running rank by total correct picks through each week. Ties share a rank. A week someone missed adds nothing, so skipping a week costs ground here. Bonus games are not counted.`).sheet;
+}
+
+/**
+ * RANK JUMP CHART -- season rank week by week, the change from the previous week, and a
+ * line chart of everyone's climb and slide across the season.
+ */
+function rankJumpChartSheet(ss, data) {
+  ss = fetchSpreadsheet(ss);
+  data = data || computePayouts(ss);
+  const weeks = Array.from({ length: REGULAR_SEASON }, (_, i) => i + 1);
+  const ranks = data.seasonCorrectRank;
+  const latest = data.rankWeeks.length ? data.rankWeeks[data.rankWeeks.length - 1] : null;
+  const previous = data.rankWeeks.length > 1 ? data.rankWeeks[data.rankWeeks.length - 2] : null;
+  const finalRank = latest ? ranks[latest] : {};
+  const names = data.names.slice().sort((a, b) =>
+    (finalRank[a] || 999) - (finalRank[b] || 999) || a.localeCompare(b));
+
+  const cols = weeks.length + 3;               // Team + 18 weeks + Rank + Change
+  const rows = names.length + 1;
+
+  let sheet = ss.getSheetByName('Rank Jump Chart') || ss.insertSheet('Rank Jump Chart');
+  sheet.getCharts().forEach(c => sheet.removeChart(c));   // rebuild cleanly
+  sheet.clear();
+  sheet.setTabColor(generalTabColor);
+  adjustRows(sheet, rows); adjustColumns(sheet, cols);
+
+  sheet.getRange(1, 1, 1, cols).setValues([['Team'].concat(weeks.map(w => `WK${w}`)).concat(['Rank', 'Change'])]);
+  const body = names.map(n => {
+    const now = finalRank[n], before = previous ? ranks[previous][n] : undefined;
+    let change = '';
+    if (now !== undefined && before !== undefined) {
+      const delta = before - now;                          // positive means climbed
+      change = delta === 0 ? '--' : (delta > 0 ? `\u25b2${delta}` : `\u25bc${Math.abs(delta)}`);
+    }
+    return [n].concat(weeks.map(w => (ranks[w] && ranks[w][n] !== undefined) ? ranks[w][n] : ''))
+      .concat([now === undefined ? '' : now, change]);
+  });
+  if (body.length) sheet.getRange(2, 1, body.length, cols).setValues(body);
+
+  const all = sheet.getRange(1, 1, rows, cols);
+  all.setHorizontalAlignment('center').setVerticalAlignment('middle').setFontFamily('Montserrat').setFontSize(10);
+  sheet.getRange(1, 1, rows, 1).setHorizontalAlignment('left');
+  sheet.getRange(1, 1, 1, cols).setBackground('black').setFontColor('white').setFontWeight('bold');
+  sheet.setColumnWidth(1, 150);
+  sheet.setColumnWidths(2, weeks.length, 34);
+  sheet.setFrozenColumns(1);
+  sheet.setFrozenRows(1);
+
+  if (names.length) {
+    // Climbers green, sliders red, in the Change column
+    sheet.clearConditionalFormatRules();
+    const changeRange = sheet.getRange(2, cols, names.length, 1);
+    sheet.setConditionalFormatRules([
+      SpreadsheetApp.newConditionalFormatRule().whenTextStartsWith('\u25b2')
+        .setFontColor('#188038').setBold(true).setRanges([changeRange]).build(),
+      SpreadsheetApp.newConditionalFormatRule().whenTextStartsWith('\u25bc')
+        .setFontColor('#c5221f').setRanges([changeRange]).build()
+    ]);
+
+    // Rank 1 belongs at the TOP of the chart, so the vertical axis is inverted
+    const chart = sheet.newChart().asLineChart()
+      .addRange(sheet.getRange(1, 1, rows, weeks.length + 1))
+      .setTransposeRowsAndColumns(true)
+      .setOption('title', `Season rank by week -- lower is better`)
+      .setOption('vAxis', { direction: -1, title: 'Rank', gridlines: { count: -1 } })
+      .setOption('hAxis', { title: 'Week' })
+      .setOption('legend', { position: 'right' })
+      .setOption('height', 420)
+      .setOption('width', 900)
+      .setPosition(rows + 3, 1, 0, 0)
+      .build();
+    sheet.insertChart(chart);
+  }
+
+  sheet.getRange(1, 1).setNote(`Season rank week by week, on cumulative correct picks. "Change" compares the latest scored week with the one before it -- green climbed, red slid. The chart plots every member's rank across the season with the axis inverted, so first place sits at the top.`);
+  return sheet;
+}
+
+/**
+ * SEASON TOTALS -- Pool 3. Weekly percentages across the regular season, with each member's
+ * best 16 pooled into W, X and Y. Weeks a member DROPPED are greyed out, so anyone can see
+ * which two weeks were discarded and check the maths by hand.
+ */
+function seasonTotalsSheet(ss, data) {
+  ss = fetchSpreadsheet(ss);
+  data = data || computePayouts(ss);
+  const weeks = Array.from({ length: REGULAR_SEASON }, (_, i) => i + 1);
+  const names = data.names.slice().sort((a, b) => data.seasonPct[b].Y - data.seasonPct[a].Y);
+  const rows = names.length + 1, cols = weeks.length + 6;
+
+  let sheet = ss.getSheetByName('Season Totals') || ss.insertSheet('Season Totals');
+  sheet.clear();
+  sheet.setTabColor(winnersTabColor);
+  adjustRows(sheet, rows); adjustColumns(sheet, cols);
+
+  sheet.getRange(1, 1, 1, cols).setValues([['Team', 'Rank', 'W', 'X', 'Y', 'Weeks Kept']
+    .concat(weeks.map(w => `WK${w}`))]);
+
+  let rank = 0, seen = null, shown = 0;
+  const body = [], fontColors = [];
+  names.forEach(n => {
+    shown++;
+    const score = data.seasonPct[n];
+    if (score.Y !== seen) { rank = shown; seen = score.Y; }
+    const kept = {};
+    score.chosenWeeks.forEach(r => kept[r.week] = true);
+    body.push([n, rank, score.W, score.X, score.Y, score.chosenWeeks.length]
+      .concat(weeks.map(w => {
+        const games = data.gamesPerWeek[w];
+        if (!games) return '';                                   // week not scored yet
+        const correct = data.weeklyCorrect[w][n];
+        return ((correct === undefined || correct === null) ? 0 : correct) / games;
+      })));
+    // Dropped weeks are faded rather than hidden -- the number still matters for checking
+    fontColors.push(['#000000', '#000000', '#000000', '#000000', '#000000', '#666666']
+      .concat(weeks.map(w => (!data.gamesPerWeek[w] || kept[w]) ? '#000000' : '#c0c0c0')));
+  });
+  if (body.length) {
+    sheet.getRange(2, 1, body.length, cols).setValues(body);
+    sheet.getRange(2, 1, body.length, cols).setFontColors(fontColors);
+    sheet.getRange(2, 5, body.length, 1).setNumberFormat('##0.00%').setFontWeight('bold');
+    sheet.getRange(2, 7, body.length, weeks.length).setNumberFormat('##0.0%;;""');
+  }
+
+  const all = sheet.getRange(1, 1, rows, cols);
+  all.setHorizontalAlignment('center').setVerticalAlignment('middle').setFontFamily('Montserrat').setFontSize(10);
+  sheet.getRange(1, 1, rows, 1).setHorizontalAlignment('left');
+  sheet.getRange(1, 1, 1, cols).setBackground('black').setFontColor('white').setFontWeight('bold').setWrap(true);
+  sheet.setRowHeight(1, 40);
+  sheet.setColumnWidth(1, 150);
+  sheet.setColumnWidths(2, 5, 55);
+  sheet.setFrozenColumns(6);
+  sheet.setFrozenRows(1);
+
+  sheet.getRange(1, 3).setNote(`W: correct picks across the member's best ${SEASON_PCT_WEEKS} weeks.`);
+  sheet.getRange(1, 4).setNote(`X: games in those same weeks. Different members keep different weeks, so X varies.`);
+  sheet.getRange(1, 5).setNote(`Y = W / X, the ranking value for this pool. It is pooled correct over pooled games, NOT the average of the weekly percentages.`);
+  sheet.getRange(1, 1).setNote(`Season % Correct, best ${SEASON_PCT_WEEKS} of ${REGULAR_SEASON} weeks. Faded percentages are weeks that member dropped. A week someone skipped counts as 0 correct against the full game count, so it lands at 0% and is almost always dropped. Bonus games do not count here -- this is straight picks correct. ${data.regularSeasonComplete ? `The $${data.seasonPctPot.toFixed(2)} pot pays ${data.ladder.length} places at ${data.ladder.join('/')}%.` : `Provisional: ${data.seasonPctWeeksAvailable} of ${REGULAR_SEASON} weeks scored, so no money is assigned yet.`}`);
+  return sheet;
+}
+
+/**
+ * STANDINGS -- the member-facing view. One row per team, money to date, and where they
+ * sit in each pool. Everything here is derived; nothing is entered by hand.
+ */
+function standingsSheet(ss, data) {
+  ss = fetchSpreadsheet(ss);
+  data = data || computePayouts(ss);
+
+  const totalWon = {};
+  data.names.forEach(n => {
+    totalWon[n] = (data.totals.weeklyWins[n] || 0) + (data.totals.weeklyConsensus[n] || 0)
+      + (data.totals.seasonPoints[n] || 0) + (data.totals.seasonConsensus[n] || 0)
+      + (data.totals.postSeason[n] || 0) + (data.totals.perfectWeek[n] || 0)
+      + (data.totals.seasonPct[n] || 0);
+  });
+  const names = data.names.slice().sort((a, b) => totalWon[b] - totalWon[a]);
+
+  const header = ['Rank', 'Team', 'Won', 'Weekly Wins', 'Weeks Won', 'Consensus $', 'Weeks Beat Crowd',
+                  'Season Points', 'Correct Picks', 'Best-16 %', 'Perfect Weeks', 'Playoff Points'];
+  const rows = names.length + 1, cols = header.length;
+
+  let sheet = ss.getSheetByName('Standings') || ss.insertSheet('Standings', 0);
+  sheet.clear();
+  sheet.setTabColor('#34a853');
+  adjustRows(sheet, rows); adjustColumns(sheet, cols);
+  sheet.getRange(1, 1, 1, cols).setValues([header]);
+
+  let rank = 0, seen = null, shown = 0;
+  const body = names.map(n => {
+    shown++;
+    if (totalWon[n] !== seen) { rank = shown; seen = totalWon[n]; }
+    const weeksWon = Object.keys(data.weeklyPlaces).filter(w => data.weeklyPlaces[w][n] === 1).length;
+    const weeksBeat = Object.keys(data.consensusMoney)
+      .filter(w => !data.consensusMoney[w].refunded && data.consensusMoney[w].money[n]).length;
+    return [rank, n, totalWon[n],
+            data.totals.weeklyWins[n] || 0, weeksWon,
+            data.totals.weeklyConsensus[n] || 0, weeksBeat,
+            data.seasonPointsTotal[n] || 0, data.seasonCorrectTotal[n] || 0,
+            (data.seasonPct[n] ? data.seasonPct[n].Y : 0),
+            data.perfectWeekEntries[n] || 0, data.playoffPointsTotal[n] || 0];
+  });
+  if (body.length) sheet.getRange(2, 1, body.length, cols).setValues(body);
+
+  const all = sheet.getRange(1, 1, rows, cols);
+  all.setHorizontalAlignment('center').setVerticalAlignment('middle').setFontFamily('Montserrat').setFontSize(10);
+  sheet.getRange(1, 2, rows, 1).setHorizontalAlignment('left');
+  sheet.getRange(1, 1, 1, cols).setBackground('black').setFontColor('white').setFontWeight('bold').setWrap(true);
+  sheet.setRowHeight(1, 42);
+  if (names.length) {
+    sheet.getRange(2, 3, names.length, 1).setNumberFormat('$#,##0.00').setFontWeight('bold');
+    sheet.getRange(2, 4, names.length, 1).setNumberFormat('$#,##0.00;[Red]-$#,##0.00;""');
+    sheet.getRange(2, 6, names.length, 1).setNumberFormat('$#,##0.00;[Red]-$#,##0.00;""');
+    sheet.getRange(2, 10, names.length, 1).setNumberFormat('##0.0%;;""');
+    const moneyRange = sheet.getRange(2, 3, names.length, 1);
+    sheet.clearConditionalFormatRules();
+    sheet.setConditionalFormatRules([SpreadsheetApp.newConditionalFormatRule()
+      .setGradientMaxpoint('#75F0A1').setGradientMinpoint('#FFFFFF')
+      .setRanges([moneyRange]).build()]);
+  }
+  sheet.setColumnWidth(1, 55);
+  sheet.setColumnWidth(2, 160);
+  sheet.setFrozenColumns(2);
+  sheet.setFrozenRows(1);
+  sheet.getRange(1, 1).setNote(`Where everyone stands, sorted by money won. Weekly figures only count weeks that are fully scored. Playoff Points is a running points total -- that pool's money is not paid until all four playoff weeks are in. Refreshed by "Update Payouts" or "Close Out Week".`);
+  return sheet;
+}
+
+/**
+ * Menu action: recompute every payout tab from the weekly sheets.
+ */
+function updatePayouts() {
+  const ss = fetchSpreadsheet();
+  const ui = fetchUi();
+  try {
+    ss.toast(`Reading weekly results...`, `💵 UPDATING PAYOUTS`);
+    const data = computePayouts(ss);
+    if (!data.entries) {
+      ui.alert(`💵 NO MEMBERS`, `There are no members yet, so there is nothing to pay out. Add members or import sign-ups first.`, ui.ButtonSet.OK);
+      return;
+    }
+    writeWeeklyPlaces(ss, data);
+    wklyPayoutSheet(ss, data);
+    wklyConsensusPayoutSheet(ss, data);
+    seasonPointsSheet(ss, data);
+    seasonTotalsSheet(ss, data);
+    playoffPointsSheet(ss, data);
+    summaryPayoutSheet(ss, data);
+    standingsSheet(ss, data);
+    wklyRankSheet(ss, data);
+    seasonRankSheet(ss, data);
+    rankJumpChartSheet(ss, data);
+
+    const scored = data.weeksScored.length;
+    const perfect = data.perfectWeekWinners.length;
+    ss.toast(`Payout tabs updated`, `✅ DONE`);
+    ui.alert(`✅ PAYOUTS UPDATED`,
+      `${data.entries} entries, ${data.ladder.length} places paid at ${data.ladder.join('/')}%.\n\n` +
+      `Weeks fully scored: ${scored}\n` +
+      `Weekly pot: $${data.weeklyPot.toFixed(2)}   Consensus pot: $${data.consensusPot.toFixed(2)}\n` +
+      `Perfect weeks: ${perfect ? data.perfectWeekWinners.join(', ') : 'none yet' + (data.perfectWeekRefunded ? ' (pot would refund evenly)' : '')}\n\n` +
+      `Season % Correct, Season Consensus and Post Season columns stay blank until those tabs are built.`,
+      ui.ButtonSet.OK);
+  } catch (err) {
+    Logger.log(`❌ updatePayouts failed: ${err.stack}`);
+    ui.alert(`⚠️ PAYOUT ERROR`, `Could not update the payout tabs:\n\n${err.message}`, ui.ButtonSet.OK);
+  }
+}
+
+// ============================================================================================================================================
+// SIGN-UP FORM
+// ============================================================================================================================================
+//
+// A standalone form for collecting entries before the season starts. Ben's tool only
+// enrolls people through a weekly form's "New User" page, which means signing up
+// requires submitting Week 1 picks -- no use in August. This form stands on its own,
+// and "Import Sign-Ups" turns the responses into members so the roster is already
+// populated by the time the Week 1 form gets built.
+
+const SIGNUP_Q_TEAM = 'Team Name';
+const SIGNUP_Q_MANAGER = 'Your Name';
+const SIGNUP_Q_EMAIL = 'Email';
+const SIGNUP_Q_CONFIRM = "Confirm your entry";
+
+/**
+ * Menu entry point. Creates the sign-up form on first use, then hands back the link.
+ */
+function launchSignupForm() {
+  const ui = fetchUi();
+  const ss = fetchSpreadsheet();
+
+  let signup = fetchProperties('signup');
+  let form = null;
+
+  if (signup && signup.formId) {
+    try {
+      const file = DriveApp.getFileById(signup.formId);
+      if (file && !file.isTrashed()) form = FormApp.openById(signup.formId);
+    } catch (err) {
+      Logger.log(`⚠️ Stored sign-up form could not be opened: ${err.message}`);
+    }
+    if (!form) {
+      Logger.log(`🧹 Clearing stale sign-up form reference`);
+      deleteProperties('signup');
+    }
+  }
+
+  if (!form) {
+    const answer = ui.alert(`✍️ CREATE SIGN-UP FORM`,
+      `No sign-up form exists yet.\n\nCreate one now? It collects a team name, the member's name, and an email address, and it does not ask for any picks -- so you can send it out well before week 1.`,
+      ui.ButtonSet.YES_NO);
+    if (answer !== ui.Button.YES) {
+      ss.toast(`Sign-up form creation canceled`,`⛔ CANCELED`);
+      return;
+    }
+    form = createSignupForm(ss);
+    if (!form) return;
+  }
+
+  const signupData = fetchProperties('signup') || {};
+  const url = signupData.publishedUrl || form.getPublishedUrl();
+  showLinkDialog(url, `✍️ Sign-Up Form`, `Sign-Up Form`,
+    `\nShare this link with your group now. Run "Import Sign-Ups" from the menu whenever you want to pull the responses in as members.`);
+}
+
+/**
+ * Builds the standalone sign-up form and records it in Document Properties.
+ *
+ * @param {Spreadsheet} [ss] Optional spreadsheet handle.
+ * @returns {Form|null} The new form, or null if it could not be created.
+ */
+function createSignupForm(ss) {
+  ss = fetchSpreadsheet(ss);
+  const config = fetchProperties('configuration') || {};
+  const groupName = config.groupName || `${LEAGUE} Picks Pool`;
+  const year = config.year || fetchYear();
+
+  try {
+    const form = FormApp.create(`${groupName} - ${year} Sign-Up`);
+    form.setDescription(`Sign up for the ${year} ${groupName}. One entry covers every pool for the season. You will get the week 1 picks form closer to kickoff -- this form is only to get you on the roster.`)
+      .setAllowResponseEdits(true)
+      .setLimitOneResponsePerUser(false)
+      .setProgressBar(false);
+
+    form.addTextItem()
+      .setTitle(SIGNUP_Q_TEAM)
+      .setHelpText(`The name that will show up on the weekly sheets and in the picks form. Pick something you will still like in December.`)
+      .setRequired(true)
+      .setValidation(nameValidation);
+
+    form.addTextItem()
+      .setTitle(SIGNUP_Q_MANAGER)
+      .setHelpText(`Your actual name, so the commissioner knows who owns the team.`)
+      .setRequired(true)
+      .setValidation(nameValidation);
+
+    form.addTextItem()
+      .setTitle(SIGNUP_Q_EMAIL)
+      .setHelpText(`Used only to send you each week's picks form.`)
+      .setRequired(true)
+      .setValidation(FormApp.createTextValidation()
+        .setHelpText('Enter a valid email address.')
+        .requireTextIsEmail()
+        .build());
+
+    const confirm = form.addMultipleChoiceItem();
+    confirm.setTitle(SIGNUP_Q_CONFIRM)
+      .setHelpText(`One entry covers the weekly pick 'ems, weekly consensus, season percentage, season points, season consensus, and the playoff pool. The commissioner will follow up about the entry fee -- do not send anything through this form.`)
+      .setChoices([confirm.createChoice(`Yes, I'm in for the ${year} season`)])
+      .showOtherOption(false)
+      .setRequired(true);
+
+    // Keep it beside the weekly forms rather than loose in Drive
+    try {
+      const folder = getFormsFolder(groupName);
+      DriveApp.getFileById(form.getId()).moveTo(folder);
+    } catch (err) {
+      Logger.log(`⚠️ Could not move the sign-up form into the pool folder: ${err.message}`);
+    }
+
+    let publishedUrl = form.getPublishedUrl();
+    try {
+      publishedUrl = form.shortenFormUrl(publishedUrl);
+    } catch (err) {
+      Logger.log(`⚠️ Could not shorten the sign-up form URL: ${err.message}`);
+    }
+
+    saveProperties('signup', {
+      formId: form.getId(),
+      editUrl: form.getEditUrl(),
+      publishedUrl: publishedUrl,
+      created: new Date().toISOString()
+    });
+
+    Logger.log(`✅ Created sign-up form ${form.getId()}`);
+    ss.toast(`Sign-up form created`,`✍️ SIGN-UP FORM READY`);
+    return form;
+  } catch (err) {
+    Logger.log(`❌ Failed to create the sign-up form: ${err.stack}`);
+    fetchUi().alert(`⚠️ SIGN-UP FORM ERROR`,`The sign-up form could not be created:\n\n${err.message}`,SpreadsheetApp.getUi().ButtonSet.OK);
+    return null;
+  }
+}
+
+/**
+ * Reads the sign-up form's responses and adds them as members, after showing you
+ * exactly who is about to be added. Nothing is written until you confirm.
+ */
+function importSignups() {
+  const ui = fetchUi();
+  const ss = fetchSpreadsheet();
+
+  const signup = fetchProperties('signup');
+  if (!signup || !signup.formId) {
+    ui.alert(`✍️ NO SIGN-UP FORM`,`There is no sign-up form yet. Run "Create or Open Sign-Up Form" first.`,ui.ButtonSet.OK);
+    return;
+  }
+
+  let form;
+  try {
+    form = FormApp.openById(signup.formId);
+  } catch (err) {
+    ui.alert(`⚠️ SIGN-UP FORM MISSING`,`The stored sign-up form could not be opened:\n\n${err.message}`,ui.ButtonSet.OK);
+    return;
+  }
+
+  const config = fetchProperties('configuration') || {};
+  const memberData = fetchProperties('members') || { memberOrder: [], members: {} };
+  memberData.memberOrder = memberData.memberOrder || [];
+  memberData.members = memberData.members || {};
+
+  // Existing names, so re-running the import never duplicates anyone
+  const taken = {};
+  memberData.memberOrder.forEach(id => {
+    const name = memberData.members[id] && memberData.members[id].name;
+    if (name) taken[name.toString().trim().toLowerCase()] = true;
+  });
+
+  const responses = form.getResponses();
+  if (!responses.length) {
+    ui.alert(`✍️ NO SIGN-UPS YET`,`The sign-up form has no responses.`,ui.ButtonSet.OK);
+    return;
+  }
+
+  const additions = [], duplicates = [], unusable = [];
+  responses.forEach(response => {
+    const answers = {};
+    response.getItemResponses().forEach(item => {
+      const title = item.getItem().getTitle().toString().trim().toLowerCase();
+      const value = item.getResponse();
+      answers[title] = (value === null || value === undefined) ? '' : value.toString().trim();
+    });
+
+    const team = answers[SIGNUP_Q_TEAM.toLowerCase()] || '';
+    const manager = answers[SIGNUP_Q_MANAGER.toLowerCase()] || '';
+    const email = answers[SIGNUP_Q_EMAIL.toLowerCase()] || '';
+
+    if (!team) {
+      unusable.push(manager || '(no name given)');
+      return;
+    }
+    const key = team.toLowerCase();
+    if (taken[key] || additions.some(a => a.key === key)) {
+      duplicates.push(team);
+      return;
+    }
+    additions.push({ key: key, team: team, manager: manager, email: email });
+  });
+
+  if (!additions.length) {
+    ui.alert(`✍️ NOTHING NEW`,`All ${responses.length} sign-up${responses.length === 1 ? '' : 's'} already match members on your roster. Nothing to add.`,ui.ButtonSet.OK);
+    return;
+  }
+
+  const preview = additions.slice(0, 25)
+    .map(a => `  • ${a.team}${a.manager ? ' (' + a.manager + ')' : ''}`)
+    .join('\n');
+  const extra = additions.length > 25 ? `\n  ...and ${additions.length - 25} more` : '';
+  const notes = [];
+  if (duplicates.length) notes.push(`${duplicates.length} already on the roster, skipped`);
+  if (unusable.length) notes.push(`${unusable.length} with no team name, skipped`);
+
+  const answer = ui.alert(`📥 IMPORT ${additions.length} SIGN-UP${additions.length === 1 ? '' : 'S'}`,
+    `About to add:\n\n${preview}${extra}\n\n${notes.length ? notes.join('; ') + '.\n\n' : ''}Add them to the roster?`,
+    ui.ButtonSet.YES_NO);
+  if (answer !== ui.Button.YES) {
+    ss.toast(`Sign-up import canceled`,`⛔ CANCELED`);
+    return;
+  }
+
+  additions.forEach(a => {
+    const id = generateUniqueId();
+    memberData.memberOrder.push(id);
+    // Sign-ups happen before kickoff, so everyone joins at week 1 and starts unpaid
+    memberData.members[id] = createNewMember(a.team, false, config, 1, { manager: a.manager, email: a.email });
+  });
+
+  saveProperties('members', memberData);
+
+  Logger.log(`✅ Imported ${additions.length} sign-up(s): ${additions.map(a => a.team).join(', ')}`);
+  ui.alert(`✅ ${additions.length} MEMBER${additions.length === 1 ? '' : 'S'} ADDED`,
+    `Your roster now has ${memberData.memberOrder.length} member${memberData.memberOrder.length === 1 ? '' : 's'}.\n\nMark who has paid in the Member Manager. If you have already deployed the tracking sheets, re-run "Deploy Extra Tracking Sheets" so the new members appear on them.`,
+    ui.ButtonSet.OK);
+}
+
+// ============================================================================================================================================
+// CONSENSUS POOL (Pool 2 weekly, Pool 5 season)
+// ============================================================================================================================================
+
+/**
+ * The group's pick for a single matchup: whichever team the majority took.
+ * A dead heat returns "TIE", which the pool rules treat as +1 for the consensus
+ * and +1 for every member.
+ *
+ * @param {Array} picks Every member's pick for one matchup.
+ * @returns {string} The majority team, "TIE" on a 50/50, or "" when nobody has picked.
+ */
+function consensusPickForGame(picks) {
+  const tally = {};
+  (picks || []).forEach(pick => {
+    const value = (pick === null || pick === undefined) ? '' : pick.toString().trim();
+    if (value) tally[value] = (tally[value] || 0) + 1;
+  });
+
+  let leader = '', leaderCount = 0, tied = false;
+  Object.keys(tally).forEach(team => {
+    if (tally[team] > leaderCount) {
+      leader = team;
+      leaderCount = tally[team];
+      tied = false;
+    } else if (tally[team] === leaderCount) {
+      tied = true;
+    }
+  });
+
+  if (!leader) return '';
+  return tied ? 'TIE' : leader;
+}
+
+/**
+ * Scores the consensus row for a week against the recorded outcomes.
+ * Only settled matchups count, so a part-played week reports what is known so far.
+ *
+ * @param {number} week The week to score.
+ * @param {Spreadsheet} [ss] Optional spreadsheet handle.
+ * @returns {Object|null} {correct, tieGames, settled, adjusted}, or null if the week has no sheet.
+ */
+function consensusWeeklyCorrect(week,ss) {
+  ss = fetchSpreadsheet(ss);
+  week = week || fetchWeek();
+
+  const picksRange = ss.getRangeByName(`${LEAGUE}_CONSENSUS_PICKS_${week}`);
+  const outcomeRange = ss.getRangeByName(`${LEAGUE}_PICKEM_OUTCOMES_${week}`);
+  if (!picksRange || !outcomeRange) {
+    Logger.log(`🤝 No consensus ranges found for week ${week}; has the weekly sheet been built?`);
+    return null;
+  }
+
+  const picks = picksRange.getValues()[0];
+  const outcomes = outcomeRange.getValues()[0];
+
+  let correct = 0, tieGames = 0, settled = 0;
+  for (let a = 0; a < outcomes.length; a++) {
+    const outcome = (outcomes[a] === null || outcomes[a] === undefined) ? '' : outcomes[a].toString().trim();
+    if (!outcome) continue;
+    settled++;
+    if (outcome.toUpperCase() === 'TIE') {
+      tieGames++;            // the NFL tied it: freebie for the crowd, same as for every member
+      continue;
+    }
+    const pick = (picks[a] === null || picks[a] === undefined) ? '' : picks[a].toString().trim();
+    // "SPLIT" means members divided 50/50, so the crowd has no pick and scores nothing here
+    if (pick && pick !== 'SPLIT' && pick === outcome) correct++;
+  }
+
+  return { correct: correct, tieGames: tieGames, settled: settled, adjusted: correct + tieGames };
+}
+
+/**
+ * Whether a member beat the crowd. Matching the consensus exactly is not a win.
+ * Both sides gain +1 per 50/50 matchup, so the tie adjustment never decides the
+ * comparison on its own -- it is applied to keep the displayed totals honest.
+ *
+ * @param {number} playerCorrect The member's raw correct picks.
+ * @param {number} consensusAdjusted The consensus score, tie games already included.
+ * @param {number} [tieGames] Count of 50/50 matchups that week.
+ * @returns {number} 1 when the member beat the consensus, otherwise 0.
+ */
+function playerBeatConsensus(playerCorrect, consensusAdjusted, tieGames) {
+  const adjustedPlayer = Number(playerCorrect || 0) + Number(tieGames || 0);
+  return adjustedPlayer > Number(consensusAdjusted || 0) ? 1 : 0;
+}
+
+// ============================================================================================================================================
 // UTILITIES
 // ============================================================================================================================================
+
+/**
+ * ESPN endpoints reject plain Apps Script requests from Google's servers with a 403
+ * often enough to break schedule and score fetching. Every ESPN call goes through
+ * these two helpers so the request carries browser-like headers and retries on the
+ * transient failures (403 / 429 / 5xx) instead of dying on the first one.
+ *
+ * @param {string} url The ESPN endpoint to fetch.
+ * @param {Object} [options] Optional UrlFetchApp params, merged over the defaults.
+ * @returns {HTTPResponse} The successful response.
+ * @throws {Error} If every attempt fails, with the last status code in the message.
+ */
+function espnFetch(url, options) {
+  const params = Object.assign({
+    method: 'get',
+    muteHttpExceptions: true,
+    followRedirects: true,
+    validateHttpsCertificates: true,
+    headers: {
+      'User-Agent': ESPN_USER_AGENT,
+      'Accept': 'application/json, text/plain, */*',
+      'Accept-Language': 'en-US,en;q=0.9',
+      'Referer': 'https://www.espn.com/',
+      'Origin': 'https://www.espn.com'
+    }
+  }, options || {});
+
+  let lastCode = null;
+  let lastBody = '';
+  for (let attempt = 1; attempt <= ESPN_FETCH_ATTEMPTS; attempt++) {
+    let response;
+    try {
+      response = UrlFetchApp.fetch(url, params);
+    } catch (err) {
+      lastCode = 'exception';
+      lastBody = err.message || '';
+      Logger.log(`⚠️ ESPN fetch attempt ${attempt}/${ESPN_FETCH_ATTEMPTS} threw for ${url}: ${err.message}`);
+      if (attempt < ESPN_FETCH_ATTEMPTS) Utilities.sleep(ESPN_FETCH_BACKOFF_MS * attempt);
+      continue;
+    }
+    const code = response.getResponseCode();
+    if (code === 200) {
+      if (attempt > 1) Logger.log(`✅ ESPN fetch recovered on attempt ${attempt} for ${url}`);
+      return response;
+    }
+    lastCode = code;
+    lastBody = response.getContentText().slice(0, 200);
+    // 4xx other than 403/429 will not fix themselves with a retry
+    if (code !== 403 && code !== 429 && code < 500) {
+      break;
+    }
+    Logger.log(`⚠️ ESPN fetch attempt ${attempt}/${ESPN_FETCH_ATTEMPTS} got ${code} for ${url}`);
+    if (attempt < ESPN_FETCH_ATTEMPTS) Utilities.sleep(ESPN_FETCH_BACKOFF_MS * attempt);
+  }
+  Logger.log(`❌ ESPN fetch failed for ${url} (last status: ${lastCode}) ${lastBody}`);
+  throw new Error(`ESPN request failed for ${url} (status ${lastCode})`);
+}
+
+/**
+ * Fetches an ESPN endpoint and returns the parsed JSON body.
+ * Throws on transport failure or unparseable body, matching the behavior callers
+ * already handle (a bare JSON.parse of an error page threw too).
+ *
+ * @param {string} url The ESPN endpoint to fetch.
+ * @param {Object} [options] Optional UrlFetchApp params.
+ * @returns {Object} The parsed JSON payload.
+ */
+function espnFetchJson(url, options) {
+  const text = espnFetch(url, options).getContentText();
+  try {
+    return JSON.parse(text);
+  } catch (err) {
+    Logger.log(`❌ ESPN returned an unparseable body for ${url}: ${text.slice(0, 200)}`);
+    throw new Error(`ESPN returned a non-JSON response for ${url}`);
+  }
+}
+
+/**
+ * Picks the game a week's tiebreaker questions should be based on.
+ *
+ * Pool rules: use the late Monday night game -- the later one when a week has two
+ * Monday games. Playoff weeks have no Monday game, so this falls back to the last
+ * kickoff of the week, which is what the playoff rules ask for anyway.
+ *
+ * DAY[n].index is already chronological across a football week
+ * (Wed -4 -> Thu -3 -> Fri -2 -> Sat -1 -> Sun 0 -> Mon 1), so sorting on it
+ * handles the Wednesday/Thursday openers without a special case.
+ *
+ * @param {Array<Object>} games The week's games, as stored in gamePlan.games.
+ * @returns {Object|null} The chosen game, or null when there are no games.
+ */
+function getTiebreakerGame(games) {
+  if (!games || games.length === 0) return null;
+
+  const kickoff = (game) => {
+    let dayIndex = 0;
+    if (game.day !== undefined && DAY[game.day]) {
+      dayIndex = DAY[game.day].index;
+    } else if (game.dayName) {
+      const match = Object.keys(DAY).find(key => DAY[key].name === game.dayName);
+      if (match !== undefined) dayIndex = DAY[match].index;
+    }
+    return (dayIndex * 1440) + ((Number(game.hour) || 0) * 60) + (Number(game.minute) || 0);
+  };
+
+  const mondayGames = games.filter(game => game.dayName === 'Monday');
+  const pool = mondayGames.length > 0 ? mondayGames : games;
+
+  let latest = pool[0];
+  for (const game of pool) {
+    // >= so a later entry in the schedule wins an exact time tie
+    if (kickoff(game) >= kickoff(latest)) latest = game;
+  }
+  Logger.log(`⚖️ Tiebreaker game selected: ${latest.awayTeam} @ ${latest.homeTeam} (${latest.dayName}, ${formatTime(latest.hour, latest.minute)})`);
+  return latest;
+}
 
 /**
  * Displays a clean modal dialog with a link for the user to click.
