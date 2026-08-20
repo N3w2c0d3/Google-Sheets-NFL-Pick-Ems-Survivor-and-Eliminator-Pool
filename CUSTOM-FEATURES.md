@@ -11,7 +11,7 @@ What's here is one commissioner's extension of it: instead of a single weekly pi
 **seven simultaneous pools** off the same set of picks, tracks the money for all of them, and
 adds some tooling for running a season without doing it by hand every Tuesday.
 
-> **Based on** upstream commit [`d400f32`](https://github.com/boilermaker-ben/Google-Sheets-NFL-Pick-Ems-Survivor-and-Eliminator-Pool/commit/d400f3259639b55a4458b27d187ce6eb0ae9a1fb) (19 Aug 2026).
+> **Based on** upstream **v1.2.2**, commit [`a8580e9`](https://github.com/boilermaker-ben/Google-Sheets-NFL-Pick-Ems-Survivor-and-Eliminator-Pool/commit/a8580e9ba) (20 Aug 2026).
 >
 > **Status:** new for the 2026 season. The scoring and payout logic is unit-tested, but it has
 > not yet been through a full live season. Treat it accordingly.
@@ -32,14 +32,17 @@ adds some tooling for running a season without doing it by hand every Tuesday.
 | **Post Season** | playoffs | 5/4/3/2/1 per playoff week, one cumulative total |
 | **Perfect Week** | any week | Get every game right. Each perfect week is a share of the pot |
 
-### A two-step tiebreaker on the right game
+### A two-step tiebreaker
 
-The weekly tiebreaker asks two questions — the **combined final score** of the tiebreaker game,
-then the **winning team's score** — and it's pinned to the **late Monday night game** (the later
-one when a week has two, falling back to the last kickoff of the week in the playoffs).
+The weekly tiebreaker asks **two** questions rather than one — the **combined final score** of
+the tiebreaker game, then the **winning team's score**, used only if the first is also tied.
+Both the form and the outcome writer read the same game, and both scores get written back
+automatically when the outcomes are fetched.
 
-The game is chosen once and stored on the week's game plan, so the form, the import and the
-outcome writer all act on the same game rather than each deciding independently.
+Which game it uses comes from Ben's own tiebreaker selector in the Form Builder (v1.2.2), so the
+commissioner picks it explicitly. If a week has no explicit choice, this fork infers the **latest
+kickoff** — the late Monday night game, or the last game of a playoff week — rather than
+whichever game happens to be last in the list.
 
 ### A consensus ("beat the crowd") entry
 
@@ -113,9 +116,11 @@ writes nothing until you confirm.
 
 - ESPN calls go through one wrapper with browser-like headers and retry-with-backoff on
   transient 403/429/5xx, instead of throwing on the first failure.
-- Three bugs in the upstream template were fixed along the way and reported back to Ben:
-  a `Ui.alert` signature error that masked real exceptions in the form builder, an undeclared
-  variable in `buildPickemQuestions`, and the tiebreaker being derived independently in two places.
+- Three bugs found in the upstream template were reported to Ben and are **now fixed upstream in
+  v1.2.2**: a `Ui.alert` signature error that masked real exceptions in the form builder, an
+  undeclared variable in `buildPickemQuestions`, and the tiebreaker being derived independently in
+  two places. Ben's fix for the third went further than the report and added the selector this
+  fork now builds on.
 
 ---
 
@@ -144,8 +149,8 @@ This was built for one specific pool, so some of its choices are opinions rather
 ## Install
 
 Same as the original: copy the template spreadsheet, then **Extensions → Apps Script**, and
-replace `picks.gs` with the version here. The HTML panel files are unchanged from upstream except
-`formCreatorPanel.html`, which is aligned with the tiebreaker change.
+replace `picks.gs` with the version here. That is the only file that differs — every HTML panel
+is identical to upstream, so there is nothing else to paste.
 
 ## License
 
