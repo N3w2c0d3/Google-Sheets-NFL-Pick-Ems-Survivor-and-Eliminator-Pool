@@ -1,4 +1,4 @@
-const VERSION = '1.2.1';
+const VERSION = '1.2.2';
 /** GOOGLE SHEETS FOOTBALL PICK 'EMS, SURVIVOR, & ELIMINATOR TOOL | 2025 Edition
  * Script Library for League Creator & Management Platform
  * 08/19/2026
@@ -145,7 +145,7 @@ function timezoneCheck(ui,docProps) {
   }
   ui = fetchUi(ui);
   const tzProp = docProps.getProperty('tz');
-  const tz = SpreadsheetApp.getActiveSpreadsheet().getSpreadsheetTimeZone();
+  const tz = Session.getScriptTimeZone();
 
   // Confirm timezone setting before continuing
   if (tzProp == null) {
@@ -3190,7 +3190,7 @@ function updateSheetsWithApiOutcomes(ss, week, completedGames, formsData, boolea
   }
   const docProps = PropertiesService.getDocumentProperties();
   const config = JSON.parse(docProps.getProperty('configuration')) || {};
-  
+
   formsData = formsData || JSON.parse(docProps.getProperty('forms')) || {};
   if (!formsData || formsData.hasOwnProperty('games')) {
     formsData = JSON.parse(docProps.getProperty('forms'));
@@ -3246,52 +3246,65 @@ function updateSheetsWithApiOutcomes(ss, week, completedGames, formsData, boolea
         }
       }
     }
+    let tiebreakerMatchup = '', tiebreakerOverUnder = 0;
+    let tbIndex = -1;
+
+    // 1. Fetch tiebreaker game and check its position if enabled
     if (config.tiebreakerInclude) {
-      const weekGamePlan = formsData[week].gamePlan;
-      // Use the game the form actually asked about. Weeks built before the tiebreaker
-      // game was pinned into the plan fall back to deriving it the same way.
-      const tiebreakerGame = weekGamePlan.tiebreakerGame || getTiebreakerGame(weekGamePlan.games);
-      const tiebreakerMatchup = tiebreakerGame ? `${tiebreakerGame.awayTeam} @ ${tiebreakerGame.homeTeam}` : null;
-
-      const placeOutcome = (outcomeRangeName, groupRangeName, value, label) => {
-        let range = ss.getRangeByName(outcomeRangeName);
-        if (!range) {
-          // Fall back to the outcome cell three rows below the member entry block
-          const groupRange = ss.getRangeByName(groupRangeName);
-          if (groupRange) range = groupRange.getSheet().getRange(groupRange.getLastRow() + 3, groupRange.getColumn());
+      const gamePlan = formsData[week]?.gamePlan;
+      let tiebreaker = null;
+      if (gamePlan && gamePlan.games) {
+        tbIndex = gamePlan.games.findIndex(g => g.tiebreaker);
+        if (tbIndex === -1 && gamePlan.games.length > 0) {
+          // Same inference as the form builder, so both always act on the same game
+          const inferred = getTiebreakerGame(gamePlan.games);
+          tbIndex = inferred ? gamePlan.games.indexOf(inferred) : gamePlan.games.length - 1;
         }
-        if (range) {
-          range.setValue(value);
-          Logger.log(`👔 Placed ${label} of ${value} from ${tiebreakerMatchup} (week ${week}).`);
-          return true;
-        }
-        Logger.log(`❗👔 Found ${label} of ${value} for ${tiebreakerMatchup} but no ${outcomeRangeName} range to place it in`);
-        ss.toast(`Found ${label} of ${value} for ${tiebreakerMatchup} but could not place it`,`❗ TIEBREAKER NOT PLACED`);
-        return false;
-      };
-
-      if (!tiebreakerMatchup) {
-        Logger.log(`⚠️ No tiebreaker game could be determined for week ${week}; skipping tiebreaker outcomes.`);
-      } else {
-        Logger.log(`⚖️ Week ${week} tiebreaker game is ${tiebreakerMatchup}. Checking for outcome availability...`);
-        const tiebreakerMatchupDetails = completedGames.find(game => game.shortName === tiebreakerMatchup);
-        if (tiebreakerMatchupDetails) {
-          const awayScore = parseInt(tiebreakerMatchupDetails.awayScore);
-          const homeScore = parseInt(tiebreakerMatchupDetails.homeScore);
-          const combinedScore = awayScore + homeScore;
-          // TB2 is the winning team's points; on a tie both teams scored the same
-          const winningScore = Math.max(awayScore, homeScore);
-          Logger.log(`🔥 ${tiebreakerMatchupDetails.winner} won the matchup — combined score ${combinedScore}, winning team scored ${winningScore}`);
-          if (Number.isFinite(combinedScore) && Number.isFinite(winningScore)) {
-            placeOutcome(`${LEAGUE}_TIEBREAKER_${week}_OUTCOME`, `${LEAGUE}_TIEBREAKER_${week}`, combinedScore, 'combined score');
-            placeOutcome(`${LEAGUE}_TIEBREAKER2_${week}_OUTCOME`, `${LEAGUE}_TIEBREAKER2_${week}`, winningScore, 'winning team score');
+        if (tbIndex !== -1) {
+          tiebreaker = gamePlan.games[tbIndex];
+          tiebreakerMatchup = `${tiebreaker.awayTeam} @ ${tiebreaker.homeTeam}`;
+          tiebreakerOverUnder = tiebreaker.overUnder;
+          Logger.log(`⚖️ From the forms data for week ${week}, the final matchup for use as a tiebreaker is ${tiebreakerMatchup}. Checking for outcome availability...`)
+          const tiebreakerMatchupDetails = completedGames.find(game => game.shortName === tiebreakerMatchup);
+          if (tiebreakerMatchupDetails) {
+            const score = parseInt(tiebreakerMatchupDetails.awayScore) + parseInt(tiebreakerMatchupDetails.homeScore);
+            Logger.log(`🔥 ${tiebreakerMatchupDetails.winner} won the matchup, combined score of ${score}`);
+            // TIEBREAKER 2: the winning team's own score, for when TB1 is also tied.
+            // On a drawn game both teams scored the same, so max() is still correct.
+            const winningScore = Math.max(parseInt(tiebreakerMatchupDetails.awayScore), parseInt(tiebreakerMatchupDetails.homeScore));
+            const tb2Range = ss.getRangeByName(`${LEAGUE}_TIEBREAKER2_${week}_OUTCOME`);
+            if (tb2Range && Number.isFinite(winningScore)) {
+              tb2Range.setValue(winningScore);
+              Logger.log(`👔 Placed winning team score of ${winningScore} from ${tiebreakerMatchup} (week ${week}).`);
+            } else if (!tb2Range) {
+              Logger.log(`❗👔 No ${LEAGUE}_TIEBREAKER2_${week}_OUTCOME range found; winning team score of ${winningScore} not placed.`);
+            }
+            if (score) {
+              let weeklySheetTiebreakerRange = ss.getRangeByName(`${LEAGUE}_TIEBREAKER_${week}_OUTCOME`);
+              if (weeklySheetTiebreakerRange) {
+                weeklySheetTiebreakerRange.setValue(score);
+                Logger.log(`👔 Successfully placed combined score of ${score} from the ${tiebreakerMatchup} tiebreaker matchup (✔️ week ${week} named range used).`);
+              } else {
+                let weeklySheetGroupTiebreakerRange = ss.getRangeByName(`${LEAGUE}_TIEBREAKER_${week}`); // If the outcome cell isn't established
+                weeklySheetTiebreakerRange = weeklySheetGroupTiebreakerRange.getSheet().getRange(weeklySheetGroupTiebreakerRange.getLastRow()+3,weeklySheetGroupTiebreakerRange.getColumn());
+                if (weeklySheetTiebreakerRange) {
+                  weeklySheetTiebreakerRange.setValue(score);
+                  Logger.log(`👔 Successfully placed combined score of ${score} from the ${tiebreakerMatchup} tiebreaker matchup (❗ week ${week} fallback tiebreaker column used).`);
+                }
+              }
+            } else {
+              Logger.log(`❗👔 Found a tiebreaker score of ${score} for the ${tiebreakerMatchup} game, but was unable to place it`);
+              ss.toast(`👔 Found a tiebreaker score of ${score} for the ${tiebreakerMatchup} game, but was unable to place it`,`❗ TIEBREAKER NOT PLACED`);
+            }
           } else {
-            Logger.log(`❗👔 Scores for ${tiebreakerMatchup} were not numeric (away: ${tiebreakerMatchupDetails.awayScore}, home: ${tiebreakerMatchupDetails.homeScore}); skipping placement.`);
+            Logger.log(`⏩ Tiebreaker matchup for week ${week} of ${tiebreakerMatchup} incomplete, skipping tiebreaker for now.`)
+            ss.toast(`Tiebreaker matchup for week ${week} of ${tiebreakerMatchup} incomplete, skipping tiebreaker for now.`,`⏩ TIEBREAKER NOT AVAILABLE`);
           }
         } else {
-          Logger.log(`⏩ Tiebreaker matchup for week ${week} of ${tiebreakerMatchup} incomplete, skipping tiebreaker for now.`)
-          ss.toast(`Tiebreaker matchup for week ${week} of ${tiebreakerMatchup} incomplete, skipping tiebreaker for now.`,`⏩ TIEBREAKER NOT AVAILABLE`);
+          Logger.log(`❗👔 Despite tiebreakers being configured, no game was able to be identified for week ${week}`);
         }
+      } else {
+        Logger.log(`⚠️ Error reading gamePlan for week ${week}...`)
       }
     } else {
       Logger.log(`👔 No tiebreaker configured for the pool.`);
@@ -3837,7 +3850,7 @@ function launchFormBuilder() {
         ss.toast('Schedule data imported successfully!', '✅ SCHEDULE DATA IMPORTED');
         // After fetching, we can proceed.
       } catch (err) {
-        ui.alert('Error', `Failed to fetch schedule data: ${err.message}`, ui.ButtonSet.OK);
+        ui.alert('⚠️ FORM BUILDER ERROR', `Failed to fetch schedule data: ${err.message}`, ui.ButtonSet.OK);
         return; // Stop if the fetch fails
       }
     } else {
@@ -3871,12 +3884,7 @@ function templateCreationPrompt(ss,ui) {
   ui = ui || fetchUi();
   try {
     const templateForm = getTemplateForm();
-    // Null check has to come first -- getTemplateForm() returns null when the user cancels,
-    // and calling getId() on it threw a TypeError that the catch below then mislabeled.
-    if (!templateForm) {
-      Logger.log(`⛔ No template form available (user canceled or creation failed)`);
-      return;
-    }
+    if (!templateForm) return;
     Logger.log(`📄 Template Form ${templateForm.getId()}`);
 
     let response = ui.alert(
@@ -4149,21 +4157,8 @@ function createNewFormForWeek(gamePlan) {
       // Record the current state of these properties for data fetching integrity
       gamePlan.pickemsInclude = config.pickemsInclude;
       gamePlan.tiebreakerInclude = config.tiebreakerInclude;
-      // Pin the tiebreaker game into the saved plan so pick import and outcome
-      // placement both act on the same game the form actually asked about.
-      if (config.tiebreakerInclude) {
-        const tiebreakerGame = getTiebreakerGame(gamePlan.games);
-        if (tiebreakerGame) {
-          gamePlan.tiebreakerGame = {
-            awayTeam: tiebreakerGame.awayTeam,
-            homeTeam: tiebreakerGame.homeTeam,
-            shortName: `${tiebreakerGame.awayTeam} @ ${tiebreakerGame.homeTeam}`,
-            dayName: tiebreakerGame.dayName,
-            hour: tiebreakerGame.hour,
-            minute: tiebreakerGame.minute
-          };
-        }
-      }
+      // The tiebreaker game itself is flagged on gamePlan.games[n].tiebreaker by the Form
+      // Builder panel, so there is no second copy of that decision to keep in sync here.
       gamePlan.survivorInclude = newFormDetails.survivorInclude;
       gamePlan.eliminatorInclude = newFormDetails.eliminatorInclude;
       gamePlan.pickemsAts = config.pickemsAts;
@@ -4820,35 +4815,51 @@ function addContestQuestion(form, contestType, member, isAts, startWeek, allTeam
  * Builds all Pick'em related questions on the form.
  */
 function buildPickemQuestions(ss, form, gamePlan, config) {
-  // Chosen once, up front. This previously fell out of the game loop below, which
-  // made the tiebreaker whichever game happened to be last in the game plan.
-  const tiebreakerGame = config.tiebreakerInclude ? getTiebreakerGame(gamePlan.games) : null;
-  if (config.tiebreakerInclude && !tiebreakerGame) {
-    Logger.log(`⚠️ Tiebreakers are enabled but no tiebreaker game could be chosen for week ${gamePlan.week}`);
+  let tiebreakerMatchup = '', tiebreakerOverUnder = 0;
+  let tbIndex = -1;
+
+  // 1. Fetch tiebreaker game and check its position if enabled
+  if (config.tiebreakerInclude) {
+    tbIndex = gamePlan.games.findIndex(g => g.tiebreaker);
+    if (tbIndex === -1 && gamePlan.games.length > 0) {
+      // No explicit choice from the Form Builder, so infer it: the latest kickoff, which is the
+      // late Monday night game in the regular season and the last game of a playoff week.
+      // Preferred over array order, which is not guaranteed to be chronological.
+      const inferred = getTiebreakerGame(gamePlan.games);
+      tbIndex = inferred ? gamePlan.games.indexOf(inferred) : gamePlan.games.length - 1;
+    }
+    if (tbIndex !== -1) {
+      const tbGame = gamePlan.games[tbIndex];
+      tiebreakerMatchup = `${tbGame.awayTeamLocation} ${tbGame.awayTeamName} and ${tbGame.homeTeamLocation} ${tbGame.homeTeamName}`;
+      tiebreakerOverUnder = tbGame.overUnder;
+    }
   }
+
+  const isTbNotLast = config.tiebreakerInclude && tbIndex !== -1 && tbIndex !== gamePlan.games.length - 1;
+
   Logger.log(`🏈 Building Pick'em questions...`);
-  gamePlan.games.forEach(game => {
+  gamePlan.games.forEach((game, index) => {
     let item = form.addMultipleChoiceItem();
     const evening = game.hour >= 17;
     const mnf = evening && game.dayName === "Monday";
     let title = `${game.awayTeamLocation} ${game.awayTeamName} at ${game.homeTeamLocation} ${game.homeTeamName}${game.divisional == 1 && game.division ? ' ('+game.division+' Divisional Game)':''}`;
     let helpText = `${mnf ? 'Monday Night Football' : game.dayName} at ${formatTime(game.hour, game.minute)}`;
-    if (config.pickemsAts && game.spread) helpText += `  | ↔️ Spread: ${game.spread}`;
-    if (game.bonus > 1) title += ` (${game.bonus == 3 ? '3️⃣' : '2️⃣'}x Bonus)`;
+    if (config.pickemsAts && game.spread) helpText += `  | ${config.hideEmojis ? '' : '↔️ '}Spread: ${game.spread}`;
+    if (game.bonus > 1) title += ` (${game.bonus == 3 ? config.hideEmojis ? '3' : '3️⃣' : config.hideEmojis ? '2' : '2️⃣'}x Bonus)`;
+    if (index === tbIndex && isTbNotLast) helpText += `  | ${config.hideEmojis ? '*' : '⚖️ '}Tiebreaker`; // Adds scale emoji if tiebreaker is not the final game
     item.setTitle(title)
       .setHelpText(helpText)
       .setChoices([
-        item.createChoice(`${!config.hideEmojis ? ' ' + LEAGUE_DATA[game.awayTeam].mascot: ''} ${game.awayTeam}`), // + LEAGUE_DATA[game.awayTeam].colors_emoji 
-        item.createChoice(`${!config.hideEmojis ? ' ' + LEAGUE_DATA[game.homeTeam].mascot: ''} ${game.homeTeam}`)]) // + LEAGUE_DATA[game.homeTeam].colors_emoji 
+        item.createChoice(`${!config.hideEmojis ? ' ' + LEAGUE_DATA[game.awayTeam].mascot : ''} ${game.awayTeam}`), // + LEAGUE_DATA[game.awayTeam].colors_emoji 
+        item.createChoice(`${!config.hideEmojis ? ' ' + LEAGUE_DATA[game.homeTeam].mascot : ''} ${game.homeTeam}`)]) // + LEAGUE_DATA[game.homeTeam].colors_emoji 
       .showOtherOption(false)
       .setRequired(true);
-    ss.toast(`Added pick 'ems question of ${game.awayTeam} @ ${game.homeTeam}`,`${LEAGUE_DATA[game.awayTeam].mascot}@${LEAGUE_DATA[game.homeTeam].mascot}`);
+    ss.toast(`Added pick 'ems question of ${game.awayTeam}@${game.homeTeam}`,`${LEAGUE_DATA[game.awayTeam].mascot}@${LEAGUE_DATA[game.homeTeam].mascot}`);
     Logger.log(`🏈 Pick 'Ems: ${LEAGUE_DATA[game.awayTeam].mascot}@${LEAGUE_DATA[game.homeTeam].mascot} created`);
   });
-  if (config.tiebreakerInclude && tiebreakerGame) { // Excludes tiebreaker questions if tiebreakers are disabled
-    const tiebreakerMatchup = `${tiebreakerGame.awayTeamLocation} ${tiebreakerGame.awayTeamName} at ${tiebreakerGame.homeTeamLocation} ${tiebreakerGame.homeTeamName}`;
-    const tiebreakerOverUnder = tiebreakerGame.overUnder;
-    const mnf = tiebreakerGame.dayName === 'Monday';
+  if (config.tiebreakerInclude && tbIndex !== -1) { // Excludes tiebreaker questions if disabled
+    const tbGame = gamePlan.games[tbIndex];
+    const tbShortName = `${tbGame.awayTeam} @ ${tbGame.homeTeam}`;
 
     const combinedValidation = FormApp.createTextValidation()
       .setHelpText('Input must be a whole number between 0 and 120')
@@ -4870,15 +4881,15 @@ function buildPickemQuestions(ss, form, gamePlan, config) {
       .setValidation(combinedValidation);
 
     // TIEBREAKER 2 -- points scored by the winning team of that same game
-    let helpTextTwo = `Points scored by the WINNING team in ${tiebreakerMatchup} (only used if Tiebreaker 1 is also tied)`;
+    let helpTextTwo = `Points scored by the WINNING team in the ${tbShortName} game (only used if Tiebreaker 1 is also tied)`;
     form.addTextItem()
       .setTitle('Tiebreaker 2')
       .setHelpText(helpTextTwo)
       .setRequired(true)
       .setValidation(winnerValidation);
 
-    ss.toast(`Created both tiebreaker questions for ${tiebreakerGame.awayTeam} @ ${tiebreakerGame.homeTeam}`,`⚖️ TIEBREAKERS CREATED`);
-    Logger.log(`⚖️ Two tiebreaker questions created for the ${mnf ? 'late MNF game' : 'last game of the week'}: ${tiebreakerMatchup}`);
+    ss.toast(`Created both tiebreaker questions for ${tbShortName}`,`⚖️ TIEBREAKERS CREATED`);
+    Logger.log(`⚖️ Two tiebreaker questions created for ${tiebreakerMatchup}`);
   }
   if(!config.commentsExclude) { // Excludes comment question if comments are disabled
     form.addTextItem()
@@ -5761,8 +5772,8 @@ function parseAllPicksFromSheet(sheet, memberData) {
   
   const survivorRegex = /survivor/i;
   const eliminatorRegex = /eliminator/i;
-  const tiebreaker2Regex = /tiebreaker\s*2/i; // must be tested before the generic one below
-  const tiebreakerRegex = /tiebreaker/i;
+  const tiebreaker2Regex = /^tiebreaker\s*2/i; // must be tested before the generic one below
+  const tiebreakerRegex = /^tiebreaker/i;
   const commentsRegex = /comments/i;
   const pickemRegex = / at /i;
 
